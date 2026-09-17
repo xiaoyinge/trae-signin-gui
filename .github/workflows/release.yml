@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: Rust 单元测试
+        run: cargo test --workspace
+
+      # tauri CLI 会自动带上 --features custom-protocol（嵌入 dist/ 前端资产）
+      - name: 构建单 exe
+        run: npm run tauri build
+
+      - name: 按版本号重命名产物
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $artifact = "trae-signin-gui-v$version.exe"
+          Copy-Item target/release/trae-signin-gui.exe $artifact
+          "ARTIFACT=$artifact" | Out-File -Append $env:GITHUB_ENV
+
+      - name: 上传构建产物（任意触发）
+        uses: actions/upload-artifact@v4
+        with:
+          name: trae-signin-gui-windows-x64
+          path: ${{ env.ARTIFACT }}
+
+      - name: 附加到 GitHub Release（仅 tag 触发）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARTIFACT }}

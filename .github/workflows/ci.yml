@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 前端类型检查与构建
+        run: npm run build
+
+      - name: Rust 单元测试
+        run: cargo test --workspace
+
+      - name: Clippy（0 警告门槛）
+        run: cargo clippy --workspace --all-targets -- -D warnings

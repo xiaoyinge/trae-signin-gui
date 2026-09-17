@@ -99,6 +99,8 @@ cargo build --release -p trae-signin-gui --features custom-protocol
 
 **注意**：`--features custom-protocol` 必须带上——它把 `dist/` 前端资产嵌入 exe；缺失时 release 运行会去请求 devUrl（localhost:5173）导致「无法访问此页面」。跳过 NSIS/MSI bundle（`tauri.conf.json` 中 `bundle.active: false`），交付物为单 exe。
 
+也可以直接推送 `v*` 格式的 tag（如 `v0.1.1`），[GitHub Actions](.github/workflows/release.yml) 会在 Windows runner 上自动跑测试、构建并把 exe 附加到对应的 Release；日常推送到 main 则由 [CI](.github/workflows/ci.yml) 自动跑前端构建、`cargo test` 与 clippy。
+
 ---
 
 ## 目录结构
