@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+/* 主题 CSS 变量（暗色为主 + 浅色可切） */
+:root {
+  --bg: #0f172a;
+  --bg-soft: #1e293b;
+  --bg-hover: #273449;
+  --border: #334155;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --accent: #14b8a6;
+  --accent-soft: rgba(20, 184, 166, 0.15);
+  --danger: #ef4444;
+  --warn: #f59e0b;
+  --ok: #22c55e;
+}
+
+html.light {
+  --bg: #f8fafc;
+  --bg-soft: #ffffff;
+  --bg-hover: #e2e8f0;
+  --border: #cbd5e1;
+  --text: #0f172a;
+  --text-dim: #64748b;
+  --accent: #0d9488;
+  --accent-soft: rgba(13, 148, 136, 0.12);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+/* 徽章 */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.badge-ok {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--ok);
+}
+.badge-already {
+  background: rgba(20, 184, 166, 0.15);
+  color: var(--accent);
+}
+.badge-disabled {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-dim);
+}
+.badge-failed {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+}
+.badge-unknown {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warn);
+}

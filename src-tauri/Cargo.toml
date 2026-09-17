@@ -1,0 +1,29 @@
+[package]
+name = "trae-signin-gui"
+version = "0.1.0"
+edition = "2021"
+description = "TRAE 签到 — Tauri 桌面版"
+
+[features]
+# release 构建必须启用：把 dist/ 前端资产嵌入 exe（官方模板约定，勿删）
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+trae-signin-core = { path = "../crates/trae-signin-core" }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

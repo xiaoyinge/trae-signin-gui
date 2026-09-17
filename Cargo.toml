@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/trae-signin-core"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
