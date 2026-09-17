@@ -20,6 +20,22 @@
 
 ---
 
+## 程序截图
+
+### 账号管理 — 批量签到、实时进度、积分展示
+
+<img src="docs/screenshots/1.png" width="820" alt="账号页：添加账号、全部签到、积分与 token 有效期展示">
+
+### 签到历史 — 最近 200 条，按账号筛选
+
+<img src="docs/screenshots/2.png" width="820" alt="签到历史页：时间、结果徽章、积分变化">
+
+### 设置 — 定时、通知、托盘与数据目录
+
+<img src="docs/screenshots/3.png" width="820" alt="设置页：每日定点、周期检查、系统通知与 Bark、开机自启、数据目录迁移">
+
+---
+
 ## 快速上手
 
 1. 双击 `trae-signin-gui.exe`。首次运行 Windows 可能弹 SmartScreen「已保护你的电脑」——点 **更多信息 → 仍要运行**（exe 未签名，属预期）。

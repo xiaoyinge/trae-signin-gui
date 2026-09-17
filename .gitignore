@@ -12,6 +12,10 @@ data-dir.txt
 *.log
 _log_probe.txt
 
+# 本地开发笔记与原始素材不入库
+CODEBUDDY.md
+impeg/
+
 # 编辑器
 .vscode/
 .idea/
