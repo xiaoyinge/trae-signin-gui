@@ -35,6 +35,8 @@ export default function SettingsPage() {
       } else {
         toast.info(r.message);
       }
+    } catch (e) {
+      toast.error(String(e));
     } finally {
       setChecking(false);
     }

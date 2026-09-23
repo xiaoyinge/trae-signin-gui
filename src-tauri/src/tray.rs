@@ -47,7 +47,8 @@ pub fn build_tray(app: &AppHandle) -> Result<TrayHandles, tauri::Error> {
                 MENU_SIGNIN_ALL => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = crate::commands::run_signin_round(&app, None, false).await {
+                        // 托盘「立即签到全部」= 手动全部签到：跳过今日已签/禁用（PLAN §10 #2）
+                        if let Err(e) = crate::commands::run_signin_round(&app, None, false, true).await {
                             log::error!("托盘签到失败: {e}");
                         }
                     });

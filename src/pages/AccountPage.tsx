@@ -8,12 +8,10 @@ import { useAccounts } from "@/stores";
 import { Button, Card, Dialog, StatusBadge, Textarea, formatExpiry } from "@/components/ui";
 import clsx from "clsx";
 
+// stage 仅三种实际 emit 的取值（L3：waiting/refreshing/claiming/querying 从未 emit，已删）
 const STAGE_TEXT: Record<string, string> = {
-  waiting: "等待中",
-  refreshing: "刷新 token",
   checking: "查询状态",
-  claiming: "签到中",
-  querying: "查询积分",
+  skipped: "跳过",
   done: "完成",
 };
 
@@ -39,10 +37,13 @@ export default function AccountPage() {
       const s = await api.signinAll();
       if (s.total === 0) {
         toast.info("没有账号");
+      } else if (s.skipped_accounts === s.total) {
+        toast.info("所有账号今日均已签或已禁用，无需签到");
       } else {
         toast.success(
           `签到完成：成功 ${s.ok} / 已签 ${s.already} / 禁用 ${s.disabled} / 失败 ${s.failed}` +
-            (s.retryable_failed > 0 ? ` / 限流 ${s.retryable_failed}（稍后自动重试）` : ""),
+            (s.retryable_failed > 0 ? ` / 限流 ${s.retryable_failed}（稍后自动重试）` : "") +
+            (s.skipped_accounts > 0 ? ` / 跳过 ${s.skipped_accounts}` : ""),
         );
       }
     } catch (e) {
@@ -238,7 +239,7 @@ function AccountCard({
   onRefresh: () => void;
   onDelete: () => void;
 }) {
-  const running = progress && progress.stage !== "done";
+  const running = progress && progress.stage !== "done" && progress.stage !== "skipped";
   // 一轮结束时若状态并非已签到类，标签不得写「完成」——读起来像签成功了
   const stageText = (() => {
     if (!progress) return "";

@@ -37,7 +37,7 @@ pub fn write_pointer(path: &std::path::Path) -> Result<(), String> {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TodayState {
     pub status: CheckinStatus,
-    pub credits: Option<i64>,
+    pub credits: Option<f64>,
     /// token 到期（秒）
     pub expires_at: Option<i64>,
     /// 401 / refreshToken 失效 → 需重新登录
@@ -138,19 +138,31 @@ impl AppState {
         self.today.lock().unwrap().insert(uid.to_string(), st);
     }
 
-    /// 汇总今日状态：(已签数, 总数)
+    /// 汇总今日状态：(已签数, 总数)。
+    /// 总数 = 全部账号**剔除已禁用**（PLAN §10 #8：disabled 本就不该被签，
+    /// 计入"已签"会与账号卡 ⛔ 语义冲突；不剔除则新导入账号漏出分母 → 不亮红点）。
+    /// 未出现在今日缓存里的账号视为未签（新导入未处理 → 亮红点）。
     pub fn today_summary(&self) -> (usize, usize) {
+        let Some(dir) = self.current_data_dir() else {
+            return (0, 0);
+        };
+        let creds = trae_signin_core::auth::list_credentials(&dir).unwrap_or_default();
+        if creds.is_empty() {
+            return (0, 0);
+        }
         let map = self.today.lock().unwrap();
-        let total = map.len();
-        let signed = map
-            .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    CheckinStatus::Ok | CheckinStatus::Already | CheckinStatus::Disabled
-                )
-            })
-            .count();
+        let mut total = 0usize;
+        let mut signed = 0usize;
+        for c in &creds {
+            match map.get(&c.uid).map(|t| t.status) {
+                Some(CheckinStatus::Disabled) => {}
+                Some(CheckinStatus::Ok | CheckinStatus::Already) => {
+                    total += 1;
+                    signed += 1;
+                }
+                _ => total += 1,
+            }
+        }
         (signed, total)
     }
 }
@@ -168,17 +180,15 @@ pub fn restore_today_from_history(state: &AppState) {
     let Ok(entries) = trae_signin_core::history::read_recent(&dir, 500) else {
         return;
     };
-    let today_start = chrono::Local::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(chrono::Local)
-        .single()
-        .map(|t| t.timestamp())
-        .unwrap_or(0);
-    // 今日记录按时间升序重放，最后一条生效
+    // 今日记录按时间升序重放，最后一条生效。
+    // 用 core 的 is_today 过滤（M9/L6 修复：旧实现构造"今日零点"时间戳，
+    // 本地午夜不存在的时区下 `.single()` 为 None → today_start=0 → 回放整个历史文件当"今日"）。
+    let now_local = chrono::Local::now();
     let mut latest: HashMap<String, &trae_signin_core::history::HistoryEntry> = HashMap::new();
-    for e in entries.iter().filter(|e| e.ts >= today_start) {
+    for e in entries
+        .iter()
+        .filter(|e| trae_signin_core::scheduler::is_today(e.ts, now_local))
+    {
         latest.insert(e.uid.clone(), e);
     }
     for (uid, e) in latest {

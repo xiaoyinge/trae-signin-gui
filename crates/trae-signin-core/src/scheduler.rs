@@ -125,4 +125,16 @@ mod tests {
         let next = next_periodic_run(0, now);
         assert_eq!(next, now + Duration::minutes(1));
     }
+
+    /// 壳层 restore_today_from_history 依赖此函数过滤今日历史（M9 改造后成为承载逻辑）
+    #[test]
+    fn is_today_filters_by_local_date() {
+        let now = Local.with_ymd_and_hms(2026, 9, 23, 10, 0, 0).unwrap();
+        let today_ts = Local.with_ymd_and_hms(2026, 9, 23, 0, 0, 30).unwrap().timestamp();
+        let yesterday_ts = Local.with_ymd_and_hms(2026, 9, 22, 23, 59, 59).unwrap().timestamp();
+        assert!(is_today(today_ts, now));
+        assert!(!is_today(yesterday_ts, now));
+        // 越界时间戳必须安全返回 false，不得 panic
+        assert!(!is_today(i64::MAX, now));
+    }
 }

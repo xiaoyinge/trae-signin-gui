@@ -19,7 +19,7 @@ pub struct HistoryEntry {
     pub nickname: String,
     pub status: CheckinStatus,
     #[serde(default)]
-    pub credits: Option<i64>,
+    pub credits: Option<f64>,
     #[serde(default)]
     pub message: String,
 }
@@ -74,7 +74,7 @@ pub fn read_recent(data_dir: &Path, limit: usize) -> Result<Vec<HistoryEntry>, c
 mod tests {
     use super::*;
 
-    fn entry(ts: i64, uid: &str, status: CheckinStatus, credits: Option<i64>) -> HistoryEntry {
+    fn entry(ts: i64, uid: &str, status: CheckinStatus, credits: Option<f64>) -> HistoryEntry {
         HistoryEntry {
             ts,
             uid: uid.into(),
@@ -88,9 +88,9 @@ mod tests {
     #[test]
     fn append_read_recent_desc() {
         let dir = std::env::temp_dir().join(format!("tsh-{}", uuid::Uuid::new_v4()));
-        append_entry(&dir, &entry(100, "u1", CheckinStatus::Ok, Some(10))).unwrap();
+        append_entry(&dir, &entry(100, "u1", CheckinStatus::Ok, Some(10.0))).unwrap();
         append_entry(&dir, &entry(300, "u2", CheckinStatus::Already, None)).unwrap();
-        append_entry(&dir, &entry(200, "u3", CheckinStatus::Failed, Some(5))).unwrap();
+        append_entry(&dir, &entry(200, "u3", CheckinStatus::Failed, Some(5.0))).unwrap();
         append_entry(&dir, &entry(400, "u4", CheckinStatus::Disabled, None)).unwrap();
 
         let all = read_recent(&dir, 200).unwrap();
@@ -129,11 +129,29 @@ mod tests {
 
     #[test]
     fn serde_field_names() {
-        let e = entry(1786858238, "u1", CheckinStatus::Ok, Some(5100));
+        let e = entry(1786858238, "u1", CheckinStatus::Ok, Some(5100.0));
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"ts\":1786858238"));
         assert!(s.contains("\"uid\":\"u1\""));
         assert!(s.contains("\"status\":\"ok\""));
         assert!(s.contains("\"credits\":5100"));
+    }
+
+    /// 小数积分不得被截断（2026-09-23 拍板）：写入与读回都保留原始精度；
+    /// 旧记录里的整数 credits（JSON 整数字面量）读入 f64 也兼容。
+    #[test]
+    fn credits_keep_fraction() {
+        let dir = std::env::temp_dir().join(format!("tsh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        append_entry(&dir, &entry(1, "u", CheckinStatus::Ok, Some(5900.5))).unwrap();
+        // 旧格式：整数字面量
+        let line = r#"{"ts":2,"uid":"u","nickname":"n","status":"already","credits":7100,"message":"m"}"#;
+        let mut f = File::options().append(true).open(history_path(&dir)).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+        let v = read_recent(&dir, 10).unwrap();
+        assert_eq!(v[1].credits, Some(5900.5));
+        assert_eq!(v[0].credits, Some(7100.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

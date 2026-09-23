@@ -85,14 +85,30 @@ pub fn find_key<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
 /// `find_key` 本身已保证「先扫本层键」，所以顶层命中从来没问题；这里补的是中间那一层：
 /// 没有顶层字段时，显式优先 `data` 包装，而不是落到全树递归的**兄弟子树字典序**上
 /// （`{"aa":{"checkedIn":true},"data":{"checkedIn":false}}` 会先命中 `aa`）。
-fn find_pref<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+/// 字段命中来源（PLAN §10 #10）：**全树兜底**命中意味着真实字段路径未定，
+/// 调用方应把完整响应体落日志取证，拿到路径后硬编码并删除全树兜底。
+enum FieldSrc {
+    Top,
+    Data,
+    Tree,
+}
+
+fn find_pref_src<'a>(v: &'a Value, name: &str) -> Option<(&'a Value, FieldSrc)> {
     let exact = |obj: &'a Value| {
         obj.as_object()
             .and_then(|m| m.iter().find(|(k, _)| normalize_key(k) == normalize_key(name)).map(|(_, val)| val))
     };
-    exact(v)
-        .or_else(|| v.get("data").and_then(exact))
-        .or_else(|| find_key(v, name))
+    if let Some(val) = exact(v) {
+        return Some((val, FieldSrc::Top));
+    }
+    if let Some(val) = v.get("data").and_then(exact) {
+        return Some((val, FieldSrc::Data));
+    }
+    find_key(v, name).map(|val| (val, FieldSrc::Tree))
+}
+
+fn find_pref<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+    find_pref_src(v, name).map(|(val, _)| val)
 }
 
 pub fn str_field(v: &Value, name: &str) -> Option<String> {
@@ -131,6 +147,14 @@ fn is_congestion(msg: &str) -> bool {
     CONGESTION_HINTS.iter().any(|h| lower.contains(h))
 }
 
+/// 实测拥塞 code 白名单（PLAN §10 #5，主判据）。
+///
+/// `9074` 来自 2026-09-16 08:47 `app.log` 实测：HTTP 200 +
+/// `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`（仅此两字段）。
+/// 文案匹配退为兜底，两者并集：任一命中即 Retryable。
+/// 每核实一个新 code 就补进来并同步 PLAN §2；不得把匹配范围扩到原始响应体。
+const CONGESTION_CODES: &[i64] = &[9074];
+
 // ─────────────────────────── API 客户端 ───────────────────────────
 
 pub struct Upstream {
@@ -167,7 +191,7 @@ pub struct CheckinOutcome {
 #[derive(Debug, Clone)]
 pub struct SigninResult {
     pub outcome: CheckinOutcome,
-    pub credits: Option<i64>,
+    pub credits: Option<f64>,
     /// refreshToken 失效 → 需重新登录
     pub need_relogin: bool,
     /// 网络/超时类失败 → 可重试
@@ -257,9 +281,10 @@ impl Upstream {
             .or_else(|| i64_field(&v, "expiresAt"))
             .map(crate::auth::normalize_expiry)
             .unwrap_or_else(|| {
-                // 无过期时刻时用 duration 推算
+                // 无过期时刻时用 duration 推算——**一律按秒**（PLAN §10 #6，对齐 Go
+                // `time.Duration(x) * time.Second`）。时长字段不做毫秒归一化：
+                // 数值判位无效（7 天毫秒 6.05×10⁸ 与长秒值区间重叠，无阈值可分）。
                 i64_field(&v, "tokenExpireDuration")
-                    .map(crate::auth::normalize_expiry)
                     .map(|d| now + d)
                     .unwrap_or(now + 7 * 86400)
             });
@@ -387,6 +412,15 @@ impl Upstream {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CoreError::Other(format!("checkin status 解析失败: {e}")))?;
+        // M8 / PLAN §10 #10：命中仅来自全树兜底 → 真实字段路径未定，落完整响应体取证；
+        // 路径一旦现形即硬编码并删除全树兜底。
+        let ci_tree = matches!(find_pref_src(&v, "checkedIn"), Some((_, FieldSrc::Tree)));
+        let en_tree = matches!(find_pref_src(&v, "enable"), Some((_, FieldSrc::Tree)));
+        if ci_tree || en_tree {
+            log::info!(
+                "checkin status 的 checkedIn/enable 来自全树兜底命中（真实字段路径未定），完整响应体: {text}"
+            );
+        }
         let checked_in = bool_field(&v, "checkedIn").unwrap_or(false);
         let enable = bool_field(&v, "enable").unwrap_or(true);
         Ok((checked_in, enable))
@@ -396,7 +430,7 @@ impl Upstream {
     ///
     /// 判定规则（三条路径实测/比对得来）：
     /// - `HTTP >= 400` → 失败；文案含"已签到/already check"归 ALREADY；401/403 → AuthExpired，408/429/5xx → Retryable
-    /// - `HTTP 2xx` + 拥塞文案（"当前参与用户太多，请稍后再试" 等，**与 `code` 取值无关**）→ **Retryable**：签到确实没生效，交给 `with_ug_retry` 退避重试
+    /// - `HTTP 2xx` + 拥塞响应（**code 白名单**（`CONGESTION_CODES`，9074 起步）或拥塞文案，任一命中）→ **Retryable**：签到确实没生效，交给 `with_ug_retry` 退避重试
     /// - `HTTP 2xx` + 其余情况 → 成功（对齐 Go `doJSON`：它从不解析响应体，只看状态码）
     ///
     /// `code` 只按「顶层 → `data` → 全树」优先序取，避免嵌套同名字段误判。完整响应体落 info 日志（`{数据目录}/app.log`），
@@ -434,13 +468,16 @@ impl Upstream {
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
         let code = i64_field(&v, "code").unwrap_or(0);
-        // 拥塞文案优先于 code：真正生效的一次签到不会回「用户太多，请稍后再试」。
-        // 判据若绑在 code != 0 上，就等于依赖一个本机无日志后端、无法核实的外部字段取值。
-        if let Some(m) = message.as_deref().filter(|m| is_congestion(m)) {
+        // 拥塞判定（PLAN §10 #5）：code 白名单为主、文案匹配为兜底（并集）。
+        // 真正生效的一次签到既不会回实测拥塞码 9074，也不会回「用户太多，请稍后再试」。
+        let congested =
+            CONGESTION_CODES.contains(&code) || message.as_deref().is_some_and(is_congestion);
+        if congested {
+            let m = message.as_deref().unwrap_or("上游繁忙");
             return Err(CoreError::Retryable(format!("上游繁忙（code={code}）: {m}")));
         }
         if code != 0 {
-            log::warn!("claim code={code} 非零但非拥塞文案，按上游 2xx 语义记为成功: {text}");
+            log::warn!("claim code={code} 非零但非拥塞，按上游 2xx 语义记为成功: {text}");
         }
         Ok(CheckinOutcome {
             status: CheckinStatus::Ok,
@@ -449,7 +486,10 @@ impl Upstream {
     }
 
     /// 查询积分余额 = sum(user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit)
-    pub async fn query_credits(&self, cred: &Credential) -> Result<i64, CoreError> {
+    ///
+    /// 返回 f64 保留上游原始精度（2026-09-23 拍板）：旧实现 `f64 as i64` 会把
+    /// 小数积分（如 5900.5）静默截断成整数。整数积分序列化后显示不变（7100 → 7100）。
+    pub async fn query_credits(&self, cred: &Credential) -> Result<f64, CoreError> {
         let url = format!("{}{EP_ENT_USAGE}", self.ug_base);
         let resp = self
             .ug_request(cred, &url)
@@ -465,12 +505,13 @@ impl Upstream {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CoreError::Other(format!("ent usage 解析失败: {e}")))?;
-        let mut total = 0i64;
+        let mut total = 0f64;
         let packs = find_key(&v, "userEntitlementPackList");
         if let Some(Value::Array(list)) = packs {
             for pack in list {
                 if let Some(limit) = find_key(pack, "creditsLimit").and_then(|x| {
-                    x.as_i64().or_else(|| x.as_f64().map(|f| f as i64))
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
                 }) {
                     total += limit;
                 }
@@ -903,6 +944,49 @@ mod tests {
         }
     }
 
+    /// code 白名单独立生效（PLAN §10 #5）：实测拥塞码 9074 即使命文案正常（或缺失）
+    /// 也必须 Retryable——上游若改写文案，白名单是最后一道防线。
+    #[tokio::test]
+    async fn claim_retries_congestion_code_whitelist() {
+        for body in [
+            r#"{"code":9074,"message":"ok"}"#,
+            r#"{"code":9074}"#,
+        ] {
+            let server = MockServer::start();
+            let m = server.mock(|when, then| {
+                when.method(POST).path(EP_CHECKIN_CLAIM);
+                then.status(200).body(body);
+            });
+            let up = Upstream::with_bases(&server.url(""), &server.url(""))
+                .with_retry_backoff(std::time::Duration::ZERO);
+            match up.checkin_claim(&cred_with("at", "d")).await {
+                Err(CoreError::Retryable(msg)) => assert!(msg.contains("9074"), "{msg}"),
+                other => panic!("expect Retryable for {body}, got {other:?}"),
+            }
+            m.assert_hits(UG_ATTEMPTS);
+        }
+    }
+
+    /// 回归锚点（PLAN §10 #6）：duration 是时长不是时间戳，一律按秒解释、
+    /// 不做毫秒归一化。604800000 若被误归一化会得 +19 年假有效期。
+    #[tokio::test]
+    async fn exchange_token_duration_is_seconds_verbatim() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path(EP_EXCHANGE_TOKEN);
+            then.status(200).body(
+                r#"{"accessToken":"at-s","refreshToken":"rt-s","tokenExpireDuration":604800000}"#,
+            );
+        });
+        let up = Upstream::with_bases(&server.url(""), &server.url(""));
+        let t = up.exchange_token("rt").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // 按秒原样采用：now + 604800000（≈19 年）。**这是拍板行为**：
+        // 若上游真回毫秒，会在几天后以 401 暴露、app.log 有原始响应体可查——
+        // 不为未实测的假设场景引入判不准的数值判位。
+        assert!((t.expires_at - (now + 604_800_000)).abs() <= 5);
+    }
+
     #[test]
     fn field_lookup_prefers_shallow_and_data_wrapper() {
         // 顶层字段恒优先于嵌套同名字段
@@ -961,8 +1045,26 @@ mod tests {
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
         let total = up.query_credits(&cred_with("at", "d")).await.unwrap();
-        assert_eq!(total, 5400);
+        assert_eq!(total, 5400.0);
         m.assert_hits(1);
+    }
+
+    /// 小数积分不得截断（2026-09-23 拍板）：旧实现 `f64 as i64` 会把 5900.5 变 5900
+    #[tokio::test]
+    async fn credits_keep_fraction() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path(EP_ENT_USAGE);
+            then.status(200).body(
+                r#"{"user_entitlement_pack_list":[
+                     {"entitlement_base_info":{"quota":{"credits_limit":3000.25}}},
+                     {"entitlement_base_info":{"quota":{"credits_limit":"2900.75"}}}
+                   ]}"#,
+            );
+        });
+        let up = Upstream::with_bases(&server.url(""), &server.url(""));
+        let total = up.query_credits(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(total, 5901.0);
     }
 
     /// 回归：刷新成功但凭证写盘失败（如盘满/只读）时，ensure_fresh_token 仍 Ok，
@@ -1011,7 +1113,7 @@ mod tests {
         let mut cred = cred_with("at", "d");
         let r = up.signin_account(&mut cred, &dir).await;
         assert_eq!(r.outcome.status, CheckinStatus::Ok);
-        assert_eq!(r.credits, Some(123));
+        assert_eq!(r.credits, Some(123.0));
         assert!(!r.need_relogin && !r.refresh_failed);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1032,7 +1134,7 @@ mod tests {
         let mut cred = cred_with("at", "d");
         let r = up.signin_account(&mut cred, &dir).await;
         assert_eq!(r.outcome.status, CheckinStatus::Already);
-        assert_eq!(r.credits, Some(0));
+        assert_eq!(r.credits, Some(0.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

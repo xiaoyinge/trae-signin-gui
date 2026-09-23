@@ -17,7 +17,7 @@ use trae_signin_core::CheckinStatus;
 pub struct AccountView {
     pub uid: String,
     pub nickname: String,
-    pub credits: Option<i64>,
+    pub credits: Option<f64>,
     pub status: CheckinStatus,
     pub expires_at: Option<i64>,
     pub need_relogin: bool,
@@ -189,9 +189,23 @@ pub fn open_data_dir(app: AppHandle) -> Result<(), String> {
     tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| e.to_string())
 }
 
+/// 外链白名单（M3 修复）：`open_external` 最终走 ShellExecute，任意字符串
+/// （`file://`、UNC、`ms-*:`）都可能触发意外行为。仅放行 https + 上游官方域名。
+const EXTERNAL_ALLOWED_HOSTS: &[&str] = &["trae.cn", "trae.com.cn"];
+
 #[tauri::command]
 pub fn open_external(_app: AppHandle, url: String) -> Result<(), String> {
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err("仅允许 https 外链".into());
+    };
+    // host = "scheme://" 后到第一个路径/查询/端口分隔符
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("");
+    let host = host.to_ascii_lowercase();
+    if EXTERNAL_ALLOWED_HOSTS.contains(&host.as_str()) {
+        tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+    } else {
+        Err(format!("外链域名 {host:?} 不在允许列表"))
+    }
 }
 
 // ─────────────────────────── 设置 ───────────────────────────
@@ -231,9 +245,11 @@ async fn sync_autostart(app: &AppHandle, settings: &Settings) {
 
 #[tauri::command]
 pub fn check_update(_app: AppHandle) -> serde_json::Value {
+    // L2 修复：原「更新源未配置」读起来像用户没配好；更新通道本就未开放（决策 #17 占位）
+    let v = app_version(_app);
     serde_json::json!({
         "configured": false,
-        "message": "更新源未配置（更新器为骨架占位，暂未接入 GitHub Releases）"
+        "message": format!("当前 v{v} 已是最新（更新通道暂未开放）")
     })
 }
 
@@ -294,10 +310,10 @@ pub fn cancel_login(app: AppHandle) {
 pub struct SigninProgress {
     pub uid: String,
     pub nickname: String,
-    pub stage: String, // waiting | refreshing | checking | claiming | querying | done
+    pub stage: String, // checking | skipped | done（L3：其余 stage 从未 emit，已删）
     pub status: Option<CheckinStatus>,
     pub message: String,
-    pub credits: Option<i64>,
+    pub credits: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -309,6 +325,8 @@ pub struct SigninSummary {
     pub failed: usize,
     /// 本轮无进展、稍后重试可能成功的账号数（上游限流/网络类）
     pub retryable_failed: usize,
+    /// 本轮因今日已签/已禁用而被跳过、未发任何上游请求的账号数（静默轮语义见 PLAN §10 #4）
+    pub skipped_accounts: usize,
     /// true = 未执行（另一轮占用互斥），调度方应顺延重试而不是记为已完成
     pub skipped: bool,
 }
@@ -321,16 +339,20 @@ fn empty_summary(skipped: bool) -> SigninSummary {
         disabled: 0,
         failed: 0,
         retryable_failed: 0,
+        skipped_accounts: 0,
         skipped,
     }
 }
 
 /// 执行一轮签到（串行、实时进度）。
 /// uids=None 全部账号；manual=true 拿不到锁报"签到进行中"，false（定时触发）静默跳过。
+/// skip_signed=true（定时轮/「全部签到」）按今日缓存跳过已签与已禁用账号；
+/// false（单账号重签）强制重走全程——假成功场景下唯一的自救通道（PLAN §10 #1/#2）。
 pub async fn run_signin_round(
     app: &AppHandle,
     uids: Option<Vec<String>>,
     manual: bool,
+    skip_signed: bool,
 ) -> Result<SigninSummary, String> {
     let st = state(app);
     let _guard = if manual {
@@ -362,6 +384,7 @@ pub async fn run_signin_round(
         disabled: 0,
         failed: 0,
         retryable_failed: 0,
+        skipped_accounts: 0,
         skipped: false,
     };
     if total == 0 {
@@ -375,7 +398,7 @@ pub async fn run_signin_round(
     for cred in creds.iter_mut() {
         let uid = cred.uid.clone();
         let nickname = if cred.nickname.is_empty() { uid.clone() } else { cred.nickname.clone() };
-        let emit = |stage: &str, message: &str, status: Option<CheckinStatus>, credits: Option<i64>| {
+        let emit = |stage: &str, message: &str, status: Option<CheckinStatus>, credits: Option<f64>| {
             let _ = app.emit(
                 "signin://progress",
                 SigninProgress {
@@ -388,6 +411,28 @@ pub async fn run_signin_round(
                 },
             );
         };
+
+        // 跳过判定：本地今日缓存已终态（已签/已禁用）→ 不发任何上游请求。
+        // guard 只在块内取值，严禁跨 await。
+        let cached = {
+            let map = st.today.lock().unwrap();
+            map.get(&uid).map(|t| t.status)
+        };
+        if skip_signed
+            && matches!(
+                cached,
+                Some(CheckinStatus::Ok | CheckinStatus::Already | CheckinStatus::Disabled)
+            )
+        {
+            summary.skipped_accounts += 1;
+            let msg = if cached == Some(CheckinStatus::Disabled) {
+                "签到功能未启用，跳过"
+            } else {
+                "今日已签，跳过"
+            };
+            emit("skipped", msg, cached, None);
+            continue;
+        }
 
         emit("checking", "查询签到状态…", None, None);
         let result = upstream.signin_account(cred, &dir).await;
@@ -452,36 +497,42 @@ pub async fn run_signin_round(
 
     let _ = app.emit("signin://done", &summary);
 
-    // 通知
-    let title = format!(
-        "TRAE 签到完成 总计{} 成功{} 已签{} 禁用{} 失败{}",
-        total, summary.ok, summary.already, summary.disabled, summary.failed
-    );
-    let body = bark_lines.join("\n");
-    system_notify(app, &settings, &title, &body);
-    if !settings.bark_url.trim().is_empty() {
-        let url = settings.bark_url.clone();
-        let title2 = title.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = bark_push(&url, &title2, &body).await {
-                log::warn!("Bark 推送失败: {e}");
-            }
-        });
+    // 通知门（PLAN §10 #4）：仅「有真实 claim（成功）或存在失败账号」的轮出声；
+    // 全跳过轮 / 纯 already+disabled 轮零通知（系统通知与 Bark 均不发）。
+    if summary.ok > 0 || summary.failed > 0 {
+        let mut title = format!(
+            "TRAE 签到完成 总计{} 成功{} 已签{} 禁用{} 失败{}",
+            total, summary.ok, summary.already, summary.disabled, summary.failed
+        );
+        if summary.skipped_accounts > 0 {
+            title.push_str(&format!(" 跳过{}", summary.skipped_accounts));
+        }
+        let body = bark_lines.join("\n");
+        system_notify(app, &settings, &title, &body);
+        if !settings.bark_url.trim().is_empty() {
+            let url = settings.bark_url.clone();
+            let title2 = title.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = bark_push(&url, &title2, &body).await {
+                    log::warn!("Bark 推送失败: {e}");
+                }
+            });
+        }
     }
 
     Ok(summary)
 }
 
-/// 单账号签到（手动重签）
+/// 单账号签到（手动重签）：强制重走全程，不受跳过逻辑约束（PLAN §10 #1）
 #[tauri::command]
 pub async fn signin_one(app: AppHandle, uid: String) -> Result<SigninSummary, String> {
-    run_signin_round(&app, Some(vec![uid]), true).await
+    run_signin_round(&app, Some(vec![uid]), true, false).await
 }
 
-/// 全部签到（手动）
+/// 全部签到（手动）：跳过今日已签/禁用，与定时轮同语义（PLAN §10 #2）
 #[tauri::command]
 pub async fn signin_all(app: AppHandle) -> Result<SigninSummary, String> {
-    run_signin_round(&app, None, true).await
+    run_signin_round(&app, None, true, true).await
 }
 
 /// 全部刷新：查询状态 + 积分（不签到）。与签到轮共用互斥（刷新会回写 token）。

@@ -6,7 +6,7 @@ use crate::commands::{run_refresh_round_inner, run_signin_round, SigninSummary};
 use crate::state::{state, AppState, DailyRetry};
 use std::sync::Mutex as StdMutex;
 use tauri::{AppHandle, Emitter};
-use trae_signin_core::scheduler::parse_daily_time;
+use trae_signin_core::scheduler::{next_daily_run, parse_daily_time};
 
 const TICK_SECS: u64 = 30;
 const STARTUP_CATCHUP_DELAY_SECS: u64 = 15;
@@ -27,7 +27,7 @@ pub fn spawn_scheduler(app: AppHandle) {
         }
         *st.startup_done.lock().unwrap() = true;
         log::info!("启动补签开始");
-        let _ = run_signin_round(&app2, None, false).await;
+        let _ = run_signin_round(&app2, None, false, true).await;
     });
 
     // 2) 常驻调度循环
@@ -107,8 +107,10 @@ async fn schedule_tick(app: &AppHandle) -> Result<(), String> {
     let now = chrono::Local::now();
     let today = now.date_naive();
 
+    // 每日定点已到 = core 计算的下次定点时刻已落到明天（M9：调度计算统一走 core，
+    // 勿在壳层自算 `now.time() >= daily`——两套逻辑将来会分叉）
     let daily_due = parse_daily_time(&settings.daily_time)
-        .is_some_and(|daily| now.time() >= daily);
+        .is_some_and(|daily| next_daily_run(daily, now).date_naive() != today);
 
     // 每日定点签到：真正跑过才记日期守卫，被锁顺延则留给下一次 tick（30s 后）重试
     if daily_due
@@ -116,7 +118,7 @@ async fn schedule_tick(app: &AppHandle) -> Result<(), String> {
         && daily_retry_ready(st, today)
     {
         log::info!("每日定点签到触发（{}）", settings.daily_time);
-        let r = run_signin_round(app, None, false).await;
+        let r = run_signin_round(app, None, false, true).await;
         if round_attempted(&r) {
             match &r {
                 // 上游把整轮挡在门外：今日槽位不算用完，按阶梯延后重试
@@ -151,7 +153,7 @@ async fn schedule_tick(app: &AppHandle) -> Result<(), String> {
         };
         if due {
             log::info!("周期检查触发（{} 分钟）", settings.periodic_check_minutes);
-            let r = run_signin_round(app, None, false).await;
+            let r = run_signin_round(app, None, false, true).await;
             // 被锁顺延时不重置计时，下一次 tick 继续尝试
             if round_attempted(&r) {
                 *st.sched_last_periodic.lock().unwrap() = Some(std::time::Instant::now());

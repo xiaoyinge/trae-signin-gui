@@ -14,7 +14,7 @@ pub struct LoginParams {
     pub machine_id: String,
     /// 32 位 hex，每账号独立生成并随凭证保存
     pub device_id: String,
-    /// 16 位 hex 追踪 id
+    /// 32 位 hex 追踪 id；同时作为回调 `state`（OAuth 防注入绑定，PLAN §10 #7）
     pub login_trace_id: String,
 }
 
@@ -22,8 +22,12 @@ pub const LOGIN_BASE_URL: &str = "https://www.trae.cn/authorization";
 pub const PLUGIN_VERSION: &str = "2.3.62834";
 
 /// 生成登录链接（query 顺序与上游一致）
+///
+/// `auth_callback_url` 内拼 `state={login_trace_id}`：上游原样跳转回我们的回调服务，
+/// 服务端严格比对后再处理（防本机任意来源注入凭证）。
 pub fn build_login_url(p: &LoginParams) -> String {
-    let callback = format!("http://127.0.0.1:{}/authorize", p.port);
+    let callback =
+        format!("http://127.0.0.1:{}/authorize?state={}", p.port, p.login_trace_id);
     format!(
         "{LOGIN_BASE_URL}?login_version=1&auth_from=solo&login_channel=native_ide\
 &plugin_version={PLUGIN_VERSION}&auth_type=local&client_id={}&redirect=0\
@@ -62,9 +66,11 @@ pub fn is_valid_device_id(d: &str) -> bool {
     d.len() == 16 && d.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// 生成 16 位 hex trace id（取 uuid 前 16 字符）
+/// 生成 32 位 hex trace id，同时充当回调 state：
+/// 回调到达时必须原样带回，防止本机任意进程/网页向回调端口注入伪造凭证
+/// （PLAN §10 #7；2026-09-23 拍板从 16 位升级到 128 位熵）。
 pub fn gen_trace_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// 极简 percent-encode（组件级：保留字母数字与 -._~）
@@ -169,22 +175,24 @@ pub fn parse_callback_query(query: &str) -> Result<CallbackData, CoreError> {
         ..Default::default()
     };
 
+    // 解析失败必须上抛（PLAN §10 #7）：静默跳过会保存出残缺凭证
+    // （如 userJwt 被截断后 JSON 解析失败 → 假过期时间 / 空 token）。
     if let Some(user_info_raw) = get("userInfo") {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&user_info_raw) {
-            data.uid = crate::upstream::str_field(&v, "UserID")
-                .or_else(|| crate::upstream::str_field(&v, "uid"))
-                .unwrap_or_default();
-            data.screen_name = crate::upstream::str_field(&v, "ScreenName").unwrap_or_default();
-        }
+        let v: serde_json::Value = serde_json::from_str(&user_info_raw)
+            .map_err(|e| CoreError::Other(format!("userInfo JSON 解析失败: {e}")))?;
+        data.uid = crate::upstream::str_field(&v, "UserID")
+            .or_else(|| crate::upstream::str_field(&v, "uid"))
+            .unwrap_or_default();
+        data.screen_name = crate::upstream::str_field(&v, "ScreenName").unwrap_or_default();
     }
 
     if let Some(jwt_raw) = get("userJwt") {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&jwt_raw) {
-            data.fallback_access_token =
-                crate::upstream::str_field(&v, "Token").unwrap_or_default();
-            if let Some(e) = crate::upstream::i64_field(&v, "TokenExpireAt") {
-                data.expires_at = Some(crate::auth::normalize_expiry(e));
-            }
+        let v: serde_json::Value = serde_json::from_str(&jwt_raw)
+            .map_err(|e| CoreError::Other(format!("userJwt JSON 解析失败: {e}")))?;
+        data.fallback_access_token =
+            crate::upstream::str_field(&v, "Token").unwrap_or_default();
+        if let Some(e) = crate::upstream::i64_field(&v, "TokenExpireAt") {
+            data.expires_at = Some(crate::auth::normalize_expiry(e));
         }
     }
 
@@ -206,7 +214,7 @@ mod tests {
             port: 18080,
             machine_id: "m123".into(),
             device_id: "d123".into(),
-            login_trace_id: "t123".into(),
+            login_trace_id: gen_trace_id(),
         };
         let url = build_login_url(&p);
         assert!(url.starts_with("https://www.trae.cn/authorization?"));
@@ -217,10 +225,15 @@ mod tests {
         assert!(url.contains("plugin_version=2.3.62834"));
         assert!(url.contains("auth_type=local"));
         assert!(url.contains("redirect=0"));
-        assert!(url.contains("login_trace_id=t123"));
-        assert!(url.contains(
-            &format!("auth_callback_url={}", urlencode("http://127.0.0.1:18080/authorize"))
-        ));
+        assert!(url.contains(&format!("login_trace_id={}", p.login_trace_id)));
+        // state 绑定：回调 URL 内必须携带 state（PLAN §10 #7）
+        assert!(url.contains(&format!(
+            "auth_callback_url={}",
+            urlencode(&format!(
+                "http://127.0.0.1:18080/authorize?state={}",
+                p.login_trace_id
+            ))
+        )));
         assert!(url.contains("machine_id=m123"));
         assert!(url.contains("device_id=d123"));
         assert!(url.contains("x_device_id=d123"));
@@ -296,6 +309,20 @@ mod tests {
     fn gen_ids_format() {
         assert_eq!(gen_machine_id().len(), 32);
         assert!(gen_machine_id().chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(gen_trace_id().len(), 16);
+        // state 绑定要求 128 位熵：32 位 hex（PLAN §10 #7）
+        assert_eq!(gen_trace_id().len(), 32);
+        assert!(gen_trace_id().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// 残缺回调必须上抛而非静默兜底（PLAN §10 #7）：
+    /// userJwt 被截断时 JSON 解析失败，静默跳过会保存出空 token / 假过期凭证。
+    #[test]
+    fn parse_callback_rejects_malformed_json() {
+        // userInfo 坏 JSON
+        let q = format!("refreshToken=rt&userInfo={}", urlencode("{bad json"));
+        assert!(parse_callback_query(&q).is_err());
+        // userJwt 坏 JSON
+        let q = format!("refreshToken=rt&userJwt={}", urlencode("{\"Token\":"));
+        assert!(parse_callback_query(&q).is_err());
     }
 }

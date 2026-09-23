@@ -106,8 +106,16 @@ export const useSettings = create<SettingsState>((set) => ({
 export function useEventBridge() {
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
+    // 严格模式下 effect 会挂载/卸载/再挂载：卸载后才 resolve 的订阅必须立即解绑，
+    // 否则监听器泄漏 + 重复 toast（M4 修复）
+    let disposed = false;
     const push = async (p: Promise<UnlistenFn>) => {
-      unlisteners.push(await p);
+      const un = await p;
+      if (disposed) {
+        un();
+      } else {
+        unlisteners.push(un);
+      }
     };
 
     push(
@@ -139,6 +147,7 @@ export function useEventBridge() {
     );
 
     return () => {
+      disposed = true;
       unlisteners.forEach((u) => u());
     };
   }, []);

@@ -63,6 +63,8 @@ export interface SigninSummary {
   failed: number;
   /** 本轮无进展、稍后会自动重试的账号数（上游限流/网络类） */
   retryable_failed: number;
+  /** 本轮因今日已签/已禁用被跳过、未发任何上游请求的账号数 */
+  skipped_accounts: number;
   /** true = 另一轮占用互斥，本轮未执行 */
   skipped: boolean;
 }
@@ -82,7 +84,6 @@ export const api = {
   initDataDir: (path: string) => invoke<Settings>("init_data_dir", { path }),
   changeDataDir: (path: string) => invoke<Settings>("change_data_dir", { path }),
   openDataDir: () => invoke<void>("open_data_dir"),
-  openExternal: (url: string) => invoke<void>("open_external", { url }),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   checkUpdate: () => invoke<{ configured: boolean; message: string }>("check_update"),
@@ -105,8 +106,6 @@ export const api = {
 
 export const onSigninProgress = (cb: (p: SigninProgress) => void) =>
   listen<SigninProgress>("signin://progress", (e) => cb(e.payload));
-export const onSigninDone = (cb: (s: SigninSummary) => void) =>
-  listen<SigninSummary>("signin://done", (e) => cb(e.payload));
 export const onLoginProgress = (cb: (p: LoginProgress) => void) =>
   listen<LoginProgress>("login://progress", (e) => cb(e.payload));
 export const onLoginDone = (cb: (p: LoginProgress) => void) =>
@@ -115,8 +114,5 @@ export const onLoginFailed = (cb: (p: LoginProgress) => void) =>
   listen<LoginProgress>("login://failed", (e) => cb(e.payload));
 export const onAccountsChanged = (cb: () => void) =>
   listen("accounts://changed", () => cb());
-export const onTrayStatus = (
-  cb: (s: { signed: number; total: number; red_dot: boolean }) => void,
-) => listen<{ signed: number; total: number; red_dot: boolean }>("tray://status", (e) => cb(e.payload));
 
 export type { UnlistenFn };

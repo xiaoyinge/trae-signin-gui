@@ -24,6 +24,19 @@ pub async fn bark_push(base_url: &str, title: &str, body: &str) -> Result<(), St
     if base.is_empty() {
         return Err("Bark URL 为空".into());
     }
+    // M6 修复：`test_bark` 会把该 URL 变成 GET 请求发出，不校验 scheme/host
+    // 可被用来探测内网或任意协议端点。仅放行 http(s)（自建 Bark 服务器可能是 http）
+    // 且 host 非空；urlencode 已防路径注入。
+    let (scheme, rest) = base
+        .split_once("://")
+        .ok_or("Bark URL 缺少 http(s):// 前缀")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!("Bark URL 仅支持 http/https，收到 {scheme}:"));
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err("Bark URL 缺少主机名".into());
+    }
     let url = format!("{base}/{}", urlencode(title));
     let url = if body.is_empty() {
         url
