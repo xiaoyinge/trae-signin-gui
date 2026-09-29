@@ -5,7 +5,13 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 // ── 类型（与 Rust 侧 serde 结构对应） ──
 
-export type CheckinStatus = "ok" | "already" | "disabled" | "failed" | "unknown";
+export type CheckinStatus =
+  | "ok"
+  | "already"
+  | "notsigned"
+  | "disabled"
+  | "failed"
+  | "unknown";
 
 export interface AccountView {
   uid: string;
@@ -92,6 +98,9 @@ export const api = {
   importCredential: (json: string) =>
     invoke<{ uid: string; nickname: string }>("import_credential", { json }),
   deleteAccount: (uid: string) => invoke<boolean>("delete_account", { uid }),
+  setDeviceId: (uid: string, deviceId: string) =>
+    invoke<boolean>("set_device_id", { uid, deviceId }),
+  detectClientDeviceIds: () => invoke<string[]>("detect_client_device_ids"),
   startLogin: () => invoke<number>("start_login"),
   cancelLogin: () => invoke<void>("cancel_login"),
   signinAll: () => invoke<SigninSummary>("signin_all"),

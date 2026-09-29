@@ -292,6 +292,54 @@ pub async fn delete_account(app: AppHandle, uid: String) -> Result<bool, String>
     Ok(deleted)
 }
 
+/// 手动设置账号设备号（从 TRAE 客户端 `storage.json` 键名
+/// `iCubeAuthInfo://icube-dc:{16位号}` 提取的真实 Aha 号）。
+///
+/// 背景（PLAN §9，2026-09-29 实测）：上游收紧 claim 设备校验后，应用内生成的设备号
+/// 无法通过**新账号**首次绑定（status 可读、claim 一律 9074），需改用客户端真号。
+#[tauri::command]
+pub async fn set_device_id(
+    app: AppHandle,
+    uid: String,
+    device_id: String,
+) -> Result<bool, String> {
+    let st = state(&app);
+    // 与签到/刷新/保活轮互斥：凭证写盘只发生在持锁的轮内（与 delete_account 同纪律，
+    // 防止"改到一半的凭证被进行中的轮回写覆盖"）。
+    let _guard = match st.signin_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Err("签到进行中，请稍后再试".into()),
+    };
+    let device_id = device_id.trim().to_string();
+    if !trae_signin_core::login::is_valid_device_id(&device_id) {
+        return Err(
+            "设备号须为 12~20 位纯数字（客户端 storage.json 中 iCubeAuthInfo://icube-dc: 键名冒号后的数字）"
+                .into(),
+        );
+    }
+    let dir = st.current_data_dir().ok_or("数据目录未初始化")?;
+    let mut creds =
+        trae_signin_core::auth::list_credentials(&dir).map_err(|e| format!("读取凭证失败: {e}"))?;
+    let cred = creds
+        .iter_mut()
+        .find(|c| c.uid == uid)
+        .ok_or_else(|| format!("账号 {uid} 不存在"))?;
+    if cred.device_id == device_id {
+        return Ok(false);
+    }
+    cred.device_id = device_id;
+    trae_signin_core::auth::save_credential(&dir, cred).map_err(|e| format!("保存凭证失败: {e}"))?;
+    log::info!("账号 {uid} 设备号已手动更新为客户端真实设备号");
+    let _ = app.emit("accounts://changed", ());
+    Ok(true)
+}
+
+/// 探测本机 TRAE 客户端真实设备号（供「设置设备号」对话框一键填充）。
+#[tauri::command]
+pub fn detect_client_device_ids() -> Vec<String> {
+    trae_signin_core::login::detect_client_device_ids()
+}
+
 // ─────────────────────────── 登录 ───────────────────────────
 
 #[tauri::command]
@@ -480,6 +528,7 @@ pub async fn run_signin_round(
         let status_text = match outcome.status {
             CheckinStatus::Ok => "✅",
             CheckinStatus::Already => "☑️",
+            CheckinStatus::NotSigned => "⬜",
             CheckinStatus::Disabled => "⛔",
             CheckinStatus::Failed => "❌",
             CheckinStatus::Unknown => "❓",
@@ -598,14 +647,34 @@ pub async fn run_refresh_round_inner(
             } else if !enable {
                 CheckinStatus::Disabled
             } else {
-                CheckinStatus::Unknown
+                // 未签且可签：如实记「未签」，不得借用 Unknown（2026-09-29 修复，
+                // 旧实现把未签显示成「未知」，与新账号开通暂态的 Disabled 残留混淆）
+                CheckinStatus::NotSigned
             };
         }
         t.credits = upstream.query_credits(cred).await.ok();
         t.expires_at = Some(cred.expires_at);
         t.last_run_ts = Some(chrono::Utc::now().timestamp());
-        st.update_today(&uid, t);
+        st.update_today(&uid, t.clone());
         update_tray(app);
+        // 发一次 done 进度事件，覆盖上一轮签到残留的 message（如「签到功能未启用」）
+        let _ = app.emit(
+            "signin://progress",
+            SigninProgress {
+                uid: uid.clone(),
+                nickname: if cred.nickname.is_empty() { uid.clone() } else { cred.nickname.clone() },
+                stage: "done".into(),
+                status: Some(t.status),
+                message: if t.need_relogin {
+                    "需重新登录".into()
+                } else if t.refresh_failed {
+                    "刷新失败（可重试）".into()
+                } else {
+                    "状态已刷新".into()
+                },
+                credits: t.credits,
+            },
+        );
         let _ = app.emit("accounts://changed", ());
     }
     Ok(())

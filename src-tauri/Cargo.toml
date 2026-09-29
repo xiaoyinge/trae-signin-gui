@@ -1,6 +1,6 @@
 [package]
 name = "trae-signin-gui"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "TRAE 签到 — Tauri 桌面版"
 

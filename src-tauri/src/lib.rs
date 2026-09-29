@@ -44,6 +44,8 @@ pub fn run() {
             commands::list_accounts,
             commands::import_credential,
             commands::delete_account,
+            commands::set_device_id,
+            commands::detect_client_device_ids,
             commands::start_login,
             commands::cancel_login,
             commands::signin_all,

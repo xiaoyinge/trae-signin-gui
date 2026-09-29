@@ -5,7 +5,7 @@ import { Plus, ClipboardPaste, RefreshCw, Zap, Trash2, Loader2, KeyRound } from 
 import { api } from "@/lib/tauri";
 import type { AccountView, SigninProgress } from "@/lib/tauri";
 import { useAccounts } from "@/stores";
-import { Button, Card, Dialog, StatusBadge, Textarea, formatExpiry } from "@/components/ui";
+import { Button, Card, Dialog, Input, StatusBadge, Textarea, formatExpiry } from "@/components/ui";
 import clsx from "clsx";
 
 // stage 仅三种实际 emit 的取值（L3：waiting/refreshing/claiming/querying 从未 emit，已删）
@@ -21,6 +21,8 @@ export default function AccountPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [deleteUid, setDeleteUid] = useState<string | null>(null);
+  const [deviceIdUid, setDeviceIdUid] = useState<string | null>(null);
+  const [deviceIdInput, setDeviceIdInput] = useState("");
   const [working, setWorking] = useState(false);
 
   useEffect(() => {
@@ -73,6 +75,11 @@ export default function AccountPage() {
       const s = await api.signinOne(uid);
       const a = accounts.find((x) => x.uid === uid);
       toast.success(`${a?.nickname ?? uid}：${summarize(s)}`);
+      if (s.retryable_failed > 0) {
+        toast.info(
+          "若为新账号且详情报 9074：上游已收紧设备校验，点账号卡 🔑「设置设备号」→「自动检测本机客户端」填入真号（一次性，见排障手册 3.9）",
+        );
+      }
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -109,6 +116,35 @@ export default function AccountPage() {
   const doCancelLogin = () => {
     api.cancelLogin();
     setLoginWaiting(null);
+  };
+
+  const doSetDeviceId = async () => {
+    if (!deviceIdUid) return;
+    try {
+      await api.setDeviceId(deviceIdUid, deviceIdInput);
+      toast.success("设备号已更新");
+      setDeviceIdUid(null);
+      setDeviceIdInput("");
+      fetchAccounts();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const doDetectDeviceId = async () => {
+    try {
+      const ids = await api.detectClientDeviceIds();
+      if (ids.length === 0) {
+        toast.error("未检测到本机 TRAE 客户端设备号（未装客户端或未登录过）");
+      } else if (ids.length > 1) {
+        toast.info(`检测到 ${ids.length} 个设备号，无法自动判定归属，请确认后手动填入：${ids.join("、")}`);
+      } else {
+        setDeviceIdInput(ids[0]);
+        toast.success("已填入本机客户端设备号");
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
   };
 
   return (
@@ -172,6 +208,10 @@ export default function AccountPage() {
                 }
               }}
               onDelete={() => setDeleteUid(a.uid)}
+              onSetDeviceId={() => {
+                setDeviceIdUid(a.uid);
+                setDeviceIdInput("");
+              }}
             />
           ))}
         </div>
@@ -213,6 +253,38 @@ export default function AccountPage() {
           </Button>
         </div>
       </Dialog>
+      {/* 设置设备号 */}
+      <Dialog open={deviceIdUid !== null} onOpenChange={(v) => !v && setDeviceIdUid(null)} title="设置设备号">
+        <p className="mb-2 text-sm">
+          为 <b>{accounts.find((a) => a.uid === deviceIdUid)?.nickname || deviceIdUid}</b>{" "}
+          填入真实设备号。
+        </p>
+        <p className="mb-2 text-xs text-[var(--text-dim)]">
+          适用场景：新账号签到报 9074「参与用户太多」（上游已收紧设备校验，应用生成的号过不了首次绑定）。
+          在<b>装过 TRAE 客户端并登录过该账号</b>的机器上，打开{" "}
+          <code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code>，找到{" "}
+          <code>iCubeAuthInfo://icube-dc:</code> 开头的键名，冒号后的 16 位数字即设备号。
+          注意一个号一天只能签一个账号。
+        </p>
+        <Input
+          className="w-full font-mono"
+          value={deviceIdInput}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setDeviceIdInput(e.target.value)}
+          placeholder="16 位纯数字设备号"
+        />
+        <div className="mt-4 flex items-center">
+          <Button variant="ghost" onClick={doDetectDeviceId}>
+            自动检测本机客户端
+          </Button>
+          <div className="flex-1" />
+          <Button variant="ghost" onClick={() => setDeviceIdUid(null)}>
+            取消
+          </Button>
+          <Button onClick={doSetDeviceId} disabled={!deviceIdInput.trim()}>
+            保存
+          </Button>
+        </div>
+      </Dialog>
     </div>
   );
 }
@@ -231,6 +303,7 @@ function AccountCard({
   onSignin,
   onRefresh,
   onDelete,
+  onSetDeviceId,
 }: {
   account: AccountView;
   progress?: SigninProgress;
@@ -238,13 +311,21 @@ function AccountCard({
   onSignin: () => void;
   onRefresh: () => void;
   onDelete: () => void;
+  onSetDeviceId: () => void;
 }) {
   const running = progress && progress.stage !== "done" && progress.stage !== "skipped";
   // 一轮结束时若状态并非已签到类，标签不得写「完成」——读起来像签成功了
   const stageText = (() => {
     if (!progress) return "";
     const { stage, status } = progress;
-    if (stage === "done" && status !== "ok" && status !== "already" && status !== "disabled") {
+    if (
+      stage === "done" &&
+      status !== "ok" &&
+      status !== "already" &&
+      status !== "disabled" &&
+      // 刷新轮的 done 事件（未签）语义就是「刷新完成」，不算签到失败
+      status !== "notsigned"
+    ) {
       return "结束";
     }
     return STAGE_TEXT[stage] ?? stage;
@@ -286,6 +367,9 @@ function AccountCard({
           </Button>
           <Button variant="ghost" onClick={onSignin} disabled={busy} title="签到">
             <Zap size={14} />
+          </Button>
+          <Button variant="ghost" onClick={onSetDeviceId} title="设置设备号（客户端真号）">
+            <KeyRound size={14} />
           </Button>
           <Button variant="danger" onClick={onDelete} title="删除">
             <Trash2 size={14} />

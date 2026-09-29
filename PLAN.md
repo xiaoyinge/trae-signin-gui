@@ -72,6 +72,11 @@
 - **实测拥塞响应体**（2026-09-16 08:47 `app.log`，HTTP 200）：`{"code":9074,"message":"当前参与用户太多，请稍后再试"}` —— 仅此两字段，无 `data` 包装。**2026-09-23 起已按 code 白名单判定（`CONGESTION_CODES`，`9074` 起步），文案匹配退为兜底（并集）**；每核实一个新 code 就补进本节与白名单。白名单只能自建：上游 `Maquer/trae-signin` 的 `doJSON` 从不解析响应体（同一条 9074 在它那里打印 `✅ OK`）
 - 判定性字段（`code`/`checkedIn`/`enable`）取值优先序：**顶层 → `data` 包装 → 全树递归**，避免兄弟子树按字典序抢先命中
 - UG 瞬时错误按 `retry_backoff * 2^n` + 抖动重试，共 `UG_ATTEMPTS = 2` 次（基础退避 **20s**；`with_retry_backoff` 可注入，测试置 0）。2026-09-16 从「3 次 / 2s」收紧：9074 的实测行为更像**按客户端限流**（同账号同 IP，客户端三连拒后 1 分钟人工补签即成功），秒级密集重试等于在同一个拒绝窗口里自激
+- **设备号 / 账号-设备绑定**（2026-09-29 登记；来源：吾爱破解 tid=2130100 实测帖 + 本机 `app.log` 铁证）：
+  - 本机证据：唯一账号 2026-09-16 11:13 由 32-hex **迁移为随机生成的 16 位号**（app.log「已迁移为 16 位数字 Aha 设备号」），此后未再 OAuth 登录，09-17 起每日 claim `code=0` → **「生成的号必然 9074」不成立**，那帖的强断言与本机实测直接矛盾
+  - 那帖对照实验：同账号同一时刻，自生成 16 位号 → 9074；客户端 `storage.json` 里的真号 → 9095。与本机证据合并后的最优解释：**账号与设备存在绑定关系**（首个有效请求先到先得），绑定设备可签、非绑定设备 9074——解释力高于「必须真实注册」，但两条都未复现实验，仅作工作假设
+  - `did_checked_in` 是**设备维度**字段（那帖）：一台设备一天只算一个账号，第二个账号 claim 回 `{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}`——**非拥塞、重试无用**。本实现已拦截（2026-09-29）：`code=9095` → 终局 `Failed` 不重试，HTTP 状态码未知故 200/4xx 两路径都拦（`DEVICE_ALREADY_SIGNED_CODE`，§9 已修）
+  - 「必须 16 位」是观察不是规则：**15 位真号存在**（那帖 v1.1 修正的就是这个）。本实现已放宽（2026-09-29）：合法形态 = 纯数字 **12~20 位**（`is_valid_device_id`），15/17 位真号不再被迁移替换（§9 已修）
 - 积分 = `sum(user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit)`；**f64 保留上游原始精度**（2026-09-23 拍板 #11，不再 `as i64` 截断小数）
 - 刷新缓冲 2 小时（`expiresAt - now <= 2h` 即刷新）
 
@@ -79,9 +84,10 @@
 
 `login_version=1, auth_from=solo, login_channel=native_ide, plugin_version=2.3.62834, auth_type=local, client_id, redirect=0, login_trace_id=<hex32>, auth_callback_url=http://127.0.0.1:{port}/authorize?state={login_trace_id}, machine_id, device_id, x_device_id, x_machine_id, x_device_brand=PC, x_device_type=PC, x_os_version=1.0, x_app_version=0.1.43, x_app_type=stable`
 
-- `machine_id`/`device_id`：32 位 hex（Rust 用 `Uuid::new_v4().simple()`），**每个账号独立生成并随凭证保存**
-- `login_trace_id`：32 位 hex，**同时作为回调 `state`**——回调时严格比对，防本机任意进程/网页注入伪造凭证（2026-09-23 拍板 #7，从 16 位升级）
-- 回调 query 关键参数：`refreshToken`、`userInfo`（JSON：`UserID`/`ScreenName`）、`userJwt`（JSON：`Token`/`RefreshToken`/`TokenExpireAt`）
+- `machine_id`：32 位 hex（Rust 用 `Uuid::new_v4().simple()`），每账号独立生成并随凭证保存
+- `device_id`：**16 位纯数字**（2026-09-16 起，`login.rs` · `gen_device_id`；旧文档写 32 位 hex 已过时，32-hex 形态会被 claim 9074 拒绝），每账号独立生成并随凭证保存
+- `login_trace_id`：32 位 hex，**防注入比对值（PLAN §10 #7，2026-09-29 修正传递通道）**：原方案把它作 `state` 拼进 `auth_callback_url`，真实登录实测上游授权页**不接受带 query 的回调地址**（页面报「登录失败/网络错误」，实验 B 去掉 state 后授权流程走通，实锤）。现回调地址回归纯 `http://127.0.0.1:{port}/authorize`，比对改走回调 query 里上游**原样带回**的 `loginTraceID`——该值 128 位熵、只存在于本机会话与登录 URL，防注入强度不变
+- 回调 query 关键参数：`refreshToken`、`userInfo`（JSON：`UserID`/`ScreenName`）、`userJwt`（JSON：`Token`/`RefreshToken`/`TokenExpireAt`）、**`loginTraceID`**（上游原样带回发起时的 `login_trace_id`，防注入比对用）；另有 `isRedirect`/`scope`/`data`/`host`/`refreshExpireAt`/`userRegion` 等参数，宽容忽略（2026-09-29 真实登录实测）
 - 优先走 `refreshToken` → ExchangeToken；无 refreshToken 时用 `userJwt.Token` 兜底
 
 **凭证文件**（`auths/trae-{uid}.json`，嵌套形态，原子写：tmp + rename）
@@ -274,6 +280,8 @@ AI-TraeQD/
 
 **2026-09-23 逐项代码复核**：24 项中已修 2 项（9074 风控请求构造、`start_login` 锁内注册），附带核对确认 2 项早前修复（凭证写盘持锁、写盘失败不阻塞）。全部修法与顺序已于同日十轮 grilling 拍板，见第 10 节。
 
+**2026-09-29 新增 4 项**（来源：吾爱破解 tid=2130100 实测帖「Trae 每日自动签到脚本，顺手把 9074 的根因挖出来了」+ 本机 `app.log` 复核；上游事实已同步第 2 节「设备号 / 账号-设备绑定」）：9095 假成功、15 位号误杀、应用内登录全链路未实测、status 每日假阳性。**同日拍板「全部修复」并落地**：9095 拦截、15 位放宽、status 取证日志三项已修（core 62 + 壳 15 测试全绿，clippy 0 警告，v0.1.1 已重新构建）；应用内「全新登录 → 首次 claim」全链路实测待有全新账号时执行（非代码可修）。
+
 排障视角的说明见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
 ### High
@@ -283,11 +291,14 @@ AI-TraeQD/
 | **拥塞识别仍靠文案匹配** | `upstream.rs` · `CONGESTION_HINTS` / `is_congestion` | 上游若改写「当前参与用户太多，请稍后再试」，响应会退回规则 3 被判为成功 → 假成功。**风险已缩小**：`app.log` 现在逐次落原始响应体，2026-09-16 实测到 `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`（仅此两字段），不再靠猜 | 改为按 code 白名单判定（从 `9074` 起步），文案匹配退为兜底（并集：任一命中即 Retryable）；每拿到一个新 code 就补进第 2 节。**白名单只能自建**：2026-09-23 复核，`Maquer/trae-signin` 2026-09-22 有新提交，但 Go 侧 `doJSON` 依旧只看状态码、从不解析响应体，同一条 9074 在它那里仍打印 `✅ OK`——它本身就是我们刚修掉的那个假成功。 |
 | ~~**9074 更像按客户端风控，不是真拥塞**~~ ✅ **已修（2026-09-16）** | `upstream.rs` · `CHECKIN_REQ_SOURCE` / `ensure_device_id_format`；`login.rs` · `gen_device_id` | ~~同账号同 IP：客户端三连拒后人工一次成功~~ | body `{"req_source":2}`（status/claim 均带）+ 16 位纯数字 `X-Device-Id`（旧 hex 自动迁移）已落地，见第 2 节与代码 |
 | **改完源码不等于改完程序（部署陷阱）** | 构建流程 | 2026-09-15 15:13 的拥塞修复**从未生效**：应用 15:03 启动后一直开着，Windows 锁住 `trae-signin-gui.exe`，后续构建只刷新了 `deps/*.rlib`，exe 仍是 15:00 那份。用户 09-16 一整天跑的是旧二进制，把一次假成功当成事实 | ✅ **2026-09-23 拍板脚本化（第 10 节 #3）**：新增 `scripts/build.ps1`（停进程 → 构建 → 核对 exe mtime 前移，失败即中止）。纪律仍见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
-| **登录回调无 state/nonce 绑定** | `login_service.rs` · `wait_authorize`；`login.rs` 生成了 `login_trace_id` 却从不校验 | 5 分钟窗口内，本机任意进程或用户访问的任意网页（`<img src="http://127.0.0.1:18080/authorize?…">`）都能注入一份攻击者的凭证，被当作你自己的账号保存并签到 | 生成 128 位 state 拼进 `auth_callback_url`，回调时严格比对；校验 `Host`；拒绝非 GET。**2026-09-23 拍板（第 10 节 #7）**：state 复用 `login_trace_id`（升 32 hex）拼进回调 URL；改完真实登录一次验证上游对回调 URL 的容忍度 |
+| **登录回调无 state/nonce 绑定** | `login_service.rs` · `wait_authorize`；`login.rs` 生成了 `login_trace_id` 却从不校验 | 5 分钟窗口内，本机任意进程或用户访问的任意网页（`<img src="http://127.0.0.1:18080/authorize?…">`）都能注入一份攻击者的凭证，被当作你自己的账号保存并签到 | 生成 128 位 state 拼进 `auth_callback_url`，回调时严格比对；校验 `Host`；拒绝非 GET。**2026-09-23 拍板（第 10 节 #7）**：state 复用 `login_trace_id`（升 32 hex）拼进回调 URL；改完真实登录一次验证上游对回调 URL 的容忍度。**2026-09-29 修正（容忍度验证变现）**：上游授权页**不接受带 query 的回调地址**（直接「登录失败/网络错误」，实验 B 去掉 state 后授权走通，实锤）；已改回调地址不带 query，防注入比对走回调 query 里上游原样带回的 `loginTraceID`（仅存于本机会话与登录 URL，强度不变），测试同步更新 |
 | **回调请求体单次 read，8192 上限** | `login_service.rs` · `wait_authorize` | `userJwt`+`userInfo` 百分号编码后可超 8 KiB → query 被截断。`parse_callback_query` 里 JSON 解析错误被 `if let Ok(v)` 吞掉 → 静默退回 `now+7d` 的假过期时间，或保存出 `refresh_token` 为空的残缺凭证 | 读到 `\r\n\r\n` 为止（带字节上限与显式"请求过大"错误）；解析失败必须上抛，不许静默兜底。**2026-09-23 拍板（第 10 节 #7）**：上限 64 KiB；解析失败**含字段缺失**一律上抛登录失败，删除 `now+7d` 假过期兜底 |
 | **machine/device id 用全局单槽暂存** | `login_service.rs` · `LAST_IDS_GLOBAL`/`stash_ids`/`take_ids` | 超时/解析失败/换取失败/取消等出口都会残留旧值；两会话重叠时 A 取到 B 的 ids 并写进 A 的凭证，而这些 id 是每次签到请求的头 | 删掉全局，把 ids 作为参数穿进 `run_callback_server`，或存进会话结构体。**2026-09-23 拍板（第 10 节 #7）**：与 M1 一起并入登录会话结构体（port + listener + ids + state 单体，探测到的 listener 直接传递），保持单会话槽 |
 | **`tokenExpireDuration` 误用毫秒归一化** | `upstream.rs` · `exchange_token` | 该字段是**时长**不是时间戳。若上游回 `604800000`（7 天的毫秒），因 `<1e12` 不除 1000 → 算出约 +19 年的有效期 → 永不刷新 → 几天后每次签到 401 | ~~duration 分支单独判位（`> 1e10` 才除 1000），并补毫秒时长测试~~ **原方案阈值有误**（2026-09-23 发现）：7 天毫秒 = 6.05×10⁸ < 10¹⁰ 照样算出 19 年，且 30 天的秒数与 1 小时的毫秒数区间重叠，无阈值可分。**拍板（第 10 节 #6）：duration 一律按秒解释**，毫秒归一化只属于时间戳分支；与 Go `time.Duration(x) * time.Second` 一致（当日核源码确认）。补测试 |
 | **签到轮不过滤今日已签账号** | `commands.rs` · `run_signin_round`；`scheduler_task.rs` 各轮 | 每轮对**全部**账号发 status+credits 请求（周期检查设 1 分钟 = 每天 1440 轮全量查询），与第 2 节判据无关但会持续加大限流概率。违背 4.3「未签则签」 | 用 `today` 缓存跳过 `ok/already/disabled`。**2026-09-23 拍板（第 10 节 #1/#2/#4）**：重签 = 强制重走全程；全部签到/定时轮 = 跳过已签与禁用；全跳过轮零通知，前端加「跳过」徽章与汇总 |
+| ~~**9095「设备今日已签」会记成假成功**~~ ✅ **已修（2026-09-29）** | `upstream.rs` · `checkin_claim_once` · `DEVICE_ALREADY_SIGNED_CODE` | ~~多账号共用设备号时，claim 回 `{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}` 会被记 Ok——假成功~~ | `checkin_claim_once` 改为 2xx/4xx 统一解析 code，`code=9095` → 终局 `Failed`（消息带上游原文），**先于**拥塞与 4xx 分支拦截；实测帖未给 HTTP 状态码，两条送达路径都覆盖。`Ok` 返回天然不触发 `with_ug_retry`。测试 `claim_9095_device_already_signed_is_failed_not_ok`（含「message 带拥塞关键词仍归终局失败」的次序回归）。本机单账号从未触发过 9095，修复属防御性判据 |
+| ~~**15 位真实设备号会被迁移逻辑误杀**~~ ✅ **已修（2026-09-29）** | `login.rs` · `is_valid_device_id`；`upstream.rs` · `ensure_device_id_format` | ~~导入 15 位真号的账号被判非法 → 静默替换成随机生成号~~ | 校验放宽为**纯数字、12~20 位**（与 tid=2130100 v1.1 的实测防呆边界一致，比原拟的 10~20 更贴实证）；32 位 hex / 空 / 超界仍迁移。迁移日志措辞同步改「非官方数字形态」。测试 `device_id_format_boundaries`（15/17 位合法、11/21 位与含字母非法） |
+| **应用内「全新登录 → 生成号 → 首次 claim」全链路未实测** | `login_service.rs` · `start_login`（`gen_device_id`）；`login.rs` · `build_login_url` | ~~从未实测~~ **✅ 已实测并闭环（2026-09-29）**：新账号应用内登录成功，但首次 claim **9074**（status 可读、claim 两轮退避全拒，app.log 实录）。结合 tid=2130100（09-28 实验）与本机 09-17 成功记录：**上游在 09-17~09-28 之间收紧了 claim 设备校验**，未注册的生成号不再被接受首次绑定；已绑定设备（老账号）不受影响。**验收通过**：导入客户端真号后 claim 成功（积分 4500→4650），全链路闭环 | 已落地**「设置设备号」**功能（`commands.rs` · `set_device_id`，账号卡 🔑 按钮）+ **自动采用**（`login.rs` · `detect_client_device_ids`：登录保存凭证时探测本机 `%APPDATA%\Trae CN\`（及国际版 `Trae\）的 `storage.json`，唯一号且未被其他账号占用则自动填入，多号/被占/未装则保持生成号并留痕日志）；持 `signin_lock` 写盘（delete_account 同纪律），校验 `is_valid_device_id`。排障指引见 TROUBLESHOOTING.md「新账号 9074」条目。**边界**：一号一天只能签一个账号，本机号源耗尽后仍需在其他机器提取 |
 
 ### Medium
 
@@ -300,7 +311,9 @@ AI-TraeQD/
 | 红点分母用「今日处理过的账号数」 | `state.rs` · `today_summary` | 新导入账号未处理前不进分母 → 明明有未签账号却显示 `已签 2/2`、不亮红点。另：`disabled` 被计入"已签"，与账号卡的 ⛔ 语义冲突。**2026-09-23 拍板（第 10 节 #8）**：分母 = 全账号剔除 disabled，红点 = 存在未签且未禁用 |
 | `bark_url` 不校验 | `notify.rs` · `bark_push`；`settings.rs` · `sanitized` | 前端与 `sanitized()` 都不校验 scheme/主机，`test_bark` 可把任意字符串发成 GET（含内网/链路本地地址）。urlencode 已防注入，无命令注入面 |
 | 每轮都弹系统通知 | `commands.rs` · `run_signin_round` 末尾 | 周期检查开启时，即使是无进展的一轮也会弹 toast；`periodic_check_minutes` 允许设 1 → 每分钟一条。**2026-09-23 拍板（第 10 节 #4）**：通知条件收紧为「有真实 claim 或有失败账号」；全跳过轮零通知（系统通知与 Bark 均不发） |
-| `find_key` 兄弟子树字典序 | `upstream.rs` · `find_pref` | 本轮已加「顶层 → `data` → 全树」优先序，但**没有顶层也没有 `data` 时**仍是按字典序取第一个嵌套命中（如 `{"profile":{"checked_in":true}}` 会压过 `{"today":{"checked_in":false}}`）。**2026-09-23 拍板（第 10 节 #10）**：命中仅来自全树兜底时把完整响应体落 `app.log`（claim 落日志同款先例），真实路径现形后硬编码并删树搜。补充事实：Go 参考实现按**顶层** `checked_in`/`enable` 解析（弱证据——解析不到会静默 false，经 already 兜底"照常工作"） |
+| `find_key` 兄弟子树字典序 | `upstream.rs` · `find_pref` | 本轮已加「顶层 → `data` → 全树」优先序，但**没有顶层也没有 `data` 时**仍是按字典序取第一个嵌套命中（如 `{"profile":{"checked_in":true}}` 会压过 `{"today":{"checked_in":false}}`）。**2026-09-23 拍板（第 10 节 #10）**：命中仅来自全树兜底时把完整响应体落 `app.log`（claim 落日志同款先例），真实路径现形后硬编码并删树搜。补充事实：Go 参考实现按**顶层** `checked_in`/`enable` 解析（弱证据——解析不到会静默 false，经 already 兜底"照常工作"）。**2026-09-29 字段已现形**：顶层 snake_case `checked_in`（取证日志首发命中），现有 find_pref 忽略 `_` 可命中，暂不硬编码 |
+| ~~**刷新把「未签且可签」记成 Unknown + 上一轮进度文案残留**~~ ✅ **已修（2026-09-29）** | `commands.rs` · `run_refresh_round_inner`；`lib.rs` · `CheckinStatus`；前端 `STATUS_META` | ~~「全部刷新」对未签且 enable=true 的账号记 Unknown（徽章「未知」），叠加签到轮残留的 done 进度文案（如「完成：签到功能未启用（积分 0）」）造成误读~~。诱因：新账号开通暂态——实测上游对新账号+新设备号在开通后几分钟内返回 `enable:false`，随后恢复 `true`（取证日志 13:15:19 false → 13:16:12 true） | 新增 `CheckinStatus::NotSigned`（"未签"），刷新如实记录；刷新完成对每账号发 done 进度事件（「状态已刷新」+ 最新积分）覆盖残留；前端加「未签」徽章。注意：当天内被缓存 Disabled 的账号，签到轮仍会跳过（§10 #1 拍板行为）——上游开通暂态场景点一次「刷新」即解封；跨天缓存清零无残留 |
+| **status 每日 07:00 假阳性（推定）**（2026-09-29 新增） | `upstream.rs` · `checkin_status` | 2026-09-17~09-29 每日 07:00 定点轮**静默跳过**（claim 必落 INFO 日志而 07:00~07:49 无任何日志 → 推定 status 报已签走了 skip），随后 07:49~07:56 周期检查轮 claim 却成功 `code=0`（实际未签）→ **status 存在假阳性**，疑服务器日界/滚动窗口与本地 0 点不一致；tid=2130100 称 `did_checked_in` 是设备维度字段。单账号仅表现为签到时间漂移到 ~07:55，多账号同设备会把未签账号错误跳过 | **取证日志已加（2026-09-29）**：`checkin_status_once` 的 2xx 响应体整体 INFO 落 `app.log`（claim 同款），次日 07:00 假阳性时刻即可取证；字段路径与语义现形后硬编码并删树搜兜底（M8 惯例） |
 | 核心 `scheduler` 的 `next_daily_run`/`is_today` 无调用方 | `crates/trae-signin-core/src/scheduler.rs` | 壳层自己用 `now.time() >= daily` + 日期守卫重算了一套；有完整单测的 API 反而是死代码，两处逻辑将来会分叉。**2026-09-23 拍板（第 10 节 #9）**：壳层改用 core API，删壳层自算逻辑 |
 
 ### Low

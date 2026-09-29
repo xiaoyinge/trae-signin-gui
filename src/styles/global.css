@@ -78,6 +78,10 @@ body {
   background: rgba(148, 163, 184, 0.15);
   color: var(--text-dim);
 }
+.badge-notsigned {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3b82f6;
+}
 .badge-failed {
   background: rgba(239, 68, 68, 0.15);
   color: var(--danger);

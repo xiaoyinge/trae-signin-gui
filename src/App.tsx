@@ -46,23 +46,25 @@ export default function App() {
 
   return (
     <div className="flex h-full">
-      {/* 侧边栏 */}
-      <nav className="flex w-16 flex-col items-center gap-1 border-r border-[var(--border)] bg-[var(--bg-soft)] py-4">
-        <div className="mb-4 flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--accent)] text-sm font-bold text-white">
-          T
+      {/* 侧边栏（展开式：图标 + 文字） */}
+      <nav className="flex w-44 shrink-0 flex-col gap-1 border-r border-[var(--border)] bg-[var(--bg-soft)] px-3 py-4">
+        <div className="mb-4 flex items-center gap-2 px-1">
+          <img src="/app-icon.png" alt="TRAE 签到" className="h-9 w-9 shrink-0" />
+          <span className="text-sm font-semibold">TRAE 签到</span>
         </div>
         {NAV.map((n) => (
           <button
             key={n.key}
             onClick={() => setPage(n.key)}
             title={n.label}
-            className={`flex h-10 w-10 cursor-pointer items-center justify-center rounded-lg transition-colors ${
+            className={`flex h-10 w-full cursor-pointer items-center gap-3 rounded-lg px-3 text-sm transition-colors ${
               page === n.key
-                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                ? "bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
                 : "text-[var(--text-dim)] hover:bg-[var(--bg-hover)] hover:text-[var(--text)]"
             }`}
           >
             {n.icon}
+            <span>{n.label}</span>
           </button>
         ))}
       </nav>

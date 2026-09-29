@@ -155,6 +155,14 @@ fn is_congestion(msg: &str) -> bool {
 /// 每核实一个新 code 就补进来并同步 PLAN §2；不得把匹配范围扩到原始响应体。
 const CONGESTION_CODES: &[i64] = &[9074];
 
+/// 设备维度「今日已签」code（PLAN §2/§9，2026-09-29 登记并拍板修复）。
+///
+/// tid=2130100 实测：`{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}`——
+/// 一台设备一天只算一个账号，属**终局拒绝**，重试必然再拒。无论 HTTP 200 还是 4xx 送达
+/// 都不得记成 Ok（假成功），统一记不可重试失败。本机未出现过该响应（单账号、设备号独立），
+/// HTTP 状态码未知，故两条路径都拦截。注意它**不是拥塞**：不得进 `CONGESTION_CODES`。
+const DEVICE_ALREADY_SIGNED_CODE: i64 = 9095;
+
 // ─────────────────────────── API 客户端 ───────────────────────────
 
 pub struct Upstream {
@@ -410,6 +418,10 @@ impl Upstream {
         if !status.is_success() {
             return Err(Self::classify_ug("checkin status", status, &text));
         }
+        // 取证（PLAN §9，2026-09-29）：status 每日 07:00 出现假阳性（定点轮 skip、
+        // 周期检查 claim 却成功），真实字段路径与语义未核（did_checked_in 设备维度？）。
+        // 与 claim 同款全量落日志以覆盖假阳性时刻；字段现形后按 M8 惯例硬编码并精简。
+        log::info!("checkin status HTTP {status} 响应体: {text}");
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CoreError::Other(format!("checkin status 解析失败: {e}")))?;
         // M8 / PLAN §10 #10：命中仅来自全树兜底 → 真实字段路径未定，落完整响应体取证；
@@ -429,6 +441,7 @@ impl Upstream {
     /// 执行签到（claim）
     ///
     /// 判定规则（三条路径实测/比对得来）：
+    /// - `code=9095`（设备维度今日已签，`DEVICE_ALREADY_SIGNED_CODE`）→ 终局 `Failed`，200/4xx 两路径都拦截、不重试，**先于**以下判定（2026-09-29 修复，PLAN §9）
     /// - `HTTP >= 400` → 失败；文案含"已签到/already check"归 ALREADY；401/403 → AuthExpired，408/429/5xx → Retryable
     /// - `HTTP 2xx` + 拥塞响应（**code 白名单**（`CONGESTION_CODES`，9074 起步）或拥塞文案，任一命中）→ **Retryable**：签到确实没生效，交给 `with_ug_retry` 退避重试
     /// - `HTTP 2xx` + 其余情况 → 成功（对齐 Go `doJSON`：它从不解析响应体，只看状态码）
@@ -450,6 +463,21 @@ impl Upstream {
             .map_err(|e| CoreError::Retryable(format!("claim 网络错误: {e}")))?;
         let status = resp.status();
         let text = resp.text().await?;
+        // 2xx/4xx 统一解析：code 判据（9095/拥塞）与送达状态码无关
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let message = str_field(&v, "message")
+            .or_else(|| str_field(&v, "msg"))
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let code = i64_field(&v, "code").unwrap_or(0);
+        // 9095 设备维度「今日已签」：终局拒绝，先于拥塞与 4xx 分支拦截（DEVICE_ALREADY_SIGNED_CODE）
+        if code == DEVICE_ALREADY_SIGNED_CODE {
+            let m = message.as_deref().unwrap_or("当前设备今日已经签到");
+            return Ok(CheckinOutcome {
+                status: CheckinStatus::Failed,
+                message: format!("设备今日已签到（code=9095，设备维度一天一次，重试无用）: {m}"),
+            });
+        }
         if status.as_u16() >= 400 {
             // 错误信息含"已签到/already check"归为 ALREADY
             let lower = text.to_lowercase();
@@ -462,12 +490,6 @@ impl Upstream {
             return Err(Self::classify_ug("claim", status, &text));
         }
         log::info!("claim HTTP {status} 响应体: {text}");
-        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let message = str_field(&v, "message")
-            .or_else(|| str_field(&v, "msg"))
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
-        let code = i64_field(&v, "code").unwrap_or(0);
         // 拥塞判定（PLAN §10 #5）：code 白名单为主、文案匹配为兜底（并集）。
         // 真正生效的一次签到既不会回实测拥塞码 9074，也不会回「用户太多，请稍后再试」。
         let congested =
@@ -552,11 +574,12 @@ impl Upstream {
         Ok(())
     }
 
-    /// 迁移历史遗留的非官方格式 deviceId（32 位 hex UUID → 16 位数字 Aha 号）。
+    /// 迁移历史遗留的非官方形态 deviceId（32 位 hex UUID / 其他超界形态 → 16 位数字 Aha 号）。
     ///
     /// claim 的活动校验会检查 `X-Device-Id` 形态，UUID 形态被 9074 拒绝。
-    /// 迁移只影响 UG 请求头；写盘失败不阻塞签到（内存中的新 id 本轮仍生效，
-    /// 下一轮会再尝试回写）。
+    /// 合法形态见 `login::is_valid_device_id`（纯数字 12~20 位，2026-09-29 放宽：
+    /// 15 位真号实测存在，不得误杀）。迁移只影响 UG 请求头；写盘失败不阻塞签到
+    /// （内存中的新 id 本轮仍生效，下一轮会再尝试回写）。
     async fn ensure_device_id_format(
         cred: &mut Credential,
         data_dir: &std::path::Path,
@@ -567,7 +590,7 @@ impl Upstream {
         cred.device_id = crate::login::gen_device_id();
         match crate::auth::save_credential(data_dir, cred) {
             Ok(_) => {
-                log::info!("账号 {} 的 deviceId 为旧 UUID 格式（会触发 9074），已迁移为 16 位数字 Aha 设备号", cred.uid);
+                log::info!("账号 {} 的 deviceId 非官方数字形态（会触发 9074），已迁移为 16 位数字 Aha 设备号", cred.uid);
                 true
             }
             Err(e) => {
@@ -834,6 +857,48 @@ mod tests {
         assert_eq!(out.status, CheckinStatus::Ok);
         assert_eq!(out.message, "签到成功");
         m4.assert_hits(1);
+    }
+
+    /// 9095 设备维度「今日已签」必须记 Failed、不得记 Ok（假成功），
+    /// 且 200/4xx 两路径都拦截、终局不重试（tid=2130100 实测，2026-09-29 修复，PLAN §9）。
+    #[tokio::test]
+    async fn claim_9095_device_already_signed_is_failed_not_ok() {
+        let server = MockServer::start();
+        let up = Upstream::with_bases(&server.url(""), &server.url(""))
+            .with_retry_backoff(std::time::Duration::ZERO);
+
+        // HTTP 200 + code=9095（实测帖未给 HTTP 状态码，200 路径必须拦）
+        let mut m = server.mock(|when, then| {
+            when.method(POST).path(EP_CHECKIN_CLAIM);
+            then.status(200)
+                .body(r#"{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}"#);
+        });
+        let out = up.checkin_claim(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(out.status, CheckinStatus::Failed);
+        assert!(out.message.contains("9095"));
+        assert!(out.message.contains("当前设备今日已经签到"));
+        m.delete();
+
+        // HTTP 400 + code=9095：若上游以 4xx 送达，同样不得落 classify_ug 的普通失败
+        let mut m2 = server.mock(|when, then| {
+            when.method(POST).path(EP_CHECKIN_CLAIM);
+            then.status(400)
+                .body(r#"{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}"#);
+        });
+        let out = up.checkin_claim(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(out.status, CheckinStatus::Failed);
+        m2.delete();
+
+        // 9095 先于拥塞判定：message 含拥塞关键词「稍后」也走终局 Failed 而非 Retryable，
+        // assert_hits(1) 同时证明终局态未触发退避重试
+        let m3 = server.mock(|when, then| {
+            when.method(POST).path(EP_CHECKIN_CLAIM);
+            then.status(200)
+                .body(r#"{"code":9095,"message":"设备已签，请稍后再试"}"#);
+        });
+        let out = up.checkin_claim(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(out.status, CheckinStatus::Failed);
+        m3.assert_hits(1);
     }
 
     /// status 请求同样携带 req_source 契约（对齐官方客户端，2026-09-04 上游收紧后

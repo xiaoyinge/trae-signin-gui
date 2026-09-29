@@ -197,7 +197,7 @@ async fn run_callback_server(
         return Err("未能获取 UserID".into());
     }
 
-    let cred = Credential {
+    let mut cred = Credential {
         access_token,
         refresh_token,
         expires_at,
@@ -221,6 +221,35 @@ async fn run_callback_server(
     let dir = state
         .current_data_dir()
         .ok_or("数据目录未初始化，请先完成首次设置")?;
+
+    // 自动采用本机客户端真实设备号（PLAN §9：上游收紧后生成号过不了新账号首次绑定）。
+    // 仅当本机检测到唯一号且未被本应用其他账号占用时自动填入；其余情况保持生成号并留痕日志。
+    match trae_signin_core::login::detect_client_device_ids().as_slice() {
+        [id] => {
+            let taken = trae_signin_core::auth::list_credentials(&dir)
+                .map(|cs| cs.iter().any(|c| c.uid != uid && c.device_id == *id))
+                .unwrap_or(false);
+            if taken {
+                log::warn!(
+                    "账号 {uid}：本机客户端设备号已被其他账号占用（一号一天只能签一个账号），保持生成号；首签若 9074 请在另一台装过客户端的机器上提取真号后手动设置"
+                );
+            } else {
+                log::info!("账号 {uid}：已自动采用本机 TRAE 客户端真实设备号");
+                cred.device_id = id.clone();
+            }
+        }
+        [_, ..] => {
+            log::warn!(
+                "账号 {uid}：本机检测到多个客户端设备号，无法自动判定归属，保持生成号；首签若 9074 请用「设置设备号」手动填入"
+            );
+        }
+        [] => {
+            log::info!(
+                "账号 {uid}：未检测到本机 TRAE 客户端设备号（未装客户端或未登录），保持生成号；首签若 9074 请手动设置设备号"
+            );
+        }
+    }
+
     trae_signin_core::auth::save_credential(&dir, &cred)
         .map_err(|e| format!("保存凭证失败: {e}"))?;
 
@@ -233,15 +262,16 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// 等待 /authorize 回调，返回**已通过校验**的 query string。
 ///
-/// 防护（PLAN §10 #7）：
+/// 防护（PLAN §10 #7，2026-09-29 修正传递通道）：
 /// - 仅接受 `GET`（其他方法 405）；
 /// - 校验 `Host` 头必须是 `127.0.0.1:{port}`（防 DNS rebinding）；
-/// - 严格比对 query 中的 `state` 与会话生成值（防本机任意进程/网页注入伪造凭证）；
+/// - 严格比对 query 中的 `loginTraceID`（上游原样带回发起时的 `login_trace_id`）与会话值
+///   （防本机任意进程/网页注入伪造凭证——该值不在回调地址里，伪造者无法得知）；
 /// - 请求头读满 64 KiB 仍无 `\r\n\r\n` → 413 并放弃该连接（会话继续等待）。
 async fn wait_authorize(
     listener: &tokio::net::TcpListener,
     port: u16,
-    expected_state: &str,
+    expected_trace_id: &str,
 ) -> Result<String, String> {
     loop {
         let (mut stream, _) = listener
@@ -332,10 +362,10 @@ async fn wait_authorize(
             continue;
         }
 
-        // state 严格比对：不匹配（伪造/重放/过期链接）→ 403 并继续等待真实回调
+        // loginTraceID 严格比对（键名忽略大小写）：不匹配（伪造/重放/过期链接）→ 403 并继续等待
         let state_ok = trae_signin_core::login::parse_query(&query)
             .into_iter()
-            .any(|(k, v)| k == "state" && v == expected_state);
+            .any(|(k, v)| k.eq_ignore_ascii_case("loginTraceID") && v == expected_trace_id);
         if !state_ok {
             log::warn!("回调 state 校验失败，疑似伪造回调，已拒绝（等待真实回调中）");
             let _ = stream
@@ -437,32 +467,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_authorize_accepts_valid_state() {
+    async fn wait_authorize_accepts_valid_trace_id() {
         let (port, listener) = probe_listener().await.unwrap();
         let st = "abc123";
-        let req = http_get(&format!("state={st}&refreshToken=rt"), &format!("127.0.0.1:{port}"));
+        let req = http_get(&format!("loginTraceID={st}&refreshToken=rt"), &format!("127.0.0.1:{port}"));
         let client = tokio::spawn(send_and_read(port, req));
         let q = wait_authorize(&listener, port, st).await.unwrap();
         let resp = client.await.unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
-        assert_eq!(q, format!("state={st}&refreshToken=rt"));
+        assert_eq!(q, format!("loginTraceID={st}&refreshToken=rt"));
     }
 
     #[tokio::test]
-    async fn wait_authorize_rejects_wrong_state() {
+    async fn wait_authorize_rejects_wrong_trace_id() {
         let (port, listener) = probe_listener().await.unwrap();
         let resp = reject_case(
             port,
             &listener,
             "real-state",
-            http_get("state=forged&refreshToken=evil", &format!("127.0.0.1:{port}")),
+            http_get("loginTraceID=forged&refreshToken=evil", &format!("127.0.0.1:{port}")),
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
     }
 
     #[tokio::test]
-    async fn wait_authorize_rejects_missing_state() {
+    async fn wait_authorize_rejects_missing_trace_id() {
         let (port, listener) = probe_listener().await.unwrap();
         let resp = reject_case(
             port,
@@ -482,7 +512,7 @@ mod tests {
             port,
             &listener,
             "real-state",
-            http_get("state=real-state", "evil.example.com"),
+            http_get("loginTraceID=real-state", "evil.example.com"),
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
@@ -492,7 +522,7 @@ mod tests {
     async fn wait_authorize_rejects_non_get() {
         let (port, listener) = probe_listener().await.unwrap();
         let raw = format!(
-            "POST /authorize?state=real-state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+            "POST /authorize?loginTraceID=real-state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
         );
         let resp = reject_case(port, &listener, "real-state", raw).await;
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
@@ -504,12 +534,12 @@ mod tests {
         let (port, listener) = probe_listener().await.unwrap();
         let st = "s".repeat(32);
         let padding = "x".repeat(10 * 1024);
-        let req = http_get(&format!("pad={padding}&state={st}"), &format!("127.0.0.1:{port}"));
+        let req = http_get(&format!("pad={padding}&loginTraceID={st}"), &format!("127.0.0.1:{port}"));
         let client = tokio::spawn(send_and_read(port, req));
         let q = wait_authorize(&listener, port, &st).await.unwrap();
         let resp = client.await.unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
-        assert!(q.ends_with(&format!("state={st}")));
+        assert!(q.ends_with(&format!("loginTraceID={st}")));
     }
 
     #[tokio::test]
@@ -521,7 +551,7 @@ mod tests {
             port,
             &listener,
             "real-state",
-            http_get(&format!("pad={padding}&state=real-state"), &format!("127.0.0.1:{port}")),
+            http_get(&format!("pad={padding}&loginTraceID=real-state"), &format!("127.0.0.1:{port}")),
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");

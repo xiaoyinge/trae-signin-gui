@@ -25,6 +25,8 @@ pub enum CheckinStatus {
     Ok,
     /// 今日已签到（status 或错误信息判定）
     Already,
+    /// 未签（刷新路径：status 查询 checked_in=false 且 enable=true，本轮未发起签到）
+    NotSigned,
     /// 账号签到功能被禁用
     Disabled,
     /// 失败
@@ -39,6 +41,7 @@ impl CheckinStatus {
         match self {
             CheckinStatus::Ok => "ok",
             CheckinStatus::Already => "already",
+            CheckinStatus::NotSigned => "notsigned",
             CheckinStatus::Disabled => "disabled",
             CheckinStatus::Failed => "failed",
             CheckinStatus::Unknown => "unknown",
@@ -49,6 +52,7 @@ impl CheckinStatus {
         match s {
             "ok" => CheckinStatus::Ok,
             "already" => CheckinStatus::Already,
+            "notsigned" => CheckinStatus::NotSigned,
             "disabled" => CheckinStatus::Disabled,
             "failed" => CheckinStatus::Failed,
             _ => CheckinStatus::Unknown,
@@ -103,6 +107,7 @@ mod tests {
         for s in [
             CheckinStatus::Ok,
             CheckinStatus::Already,
+            CheckinStatus::NotSigned,
             CheckinStatus::Disabled,
             CheckinStatus::Failed,
             CheckinStatus::Unknown,

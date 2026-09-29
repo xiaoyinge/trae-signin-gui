@@ -47,6 +47,7 @@ export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElemen
 export const STATUS_META: Record<CheckinStatus, { label: string; cls: string }> = {
   ok: { label: "已签", cls: "badge-ok" },
   already: { label: "已签(重复)", cls: "badge-already" },
+  notsigned: { label: "未签", cls: "badge-notsigned" },
   disabled: { label: "禁用", cls: "badge-disabled" },
   failed: { label: "失败", cls: "badge-failed" },
   unknown: { label: "未知", cls: "badge-unknown" },

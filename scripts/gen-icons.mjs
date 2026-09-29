@@ -1,10 +1,12 @@
 // 生成 Tauri 所需图标（纯 Node，无依赖）：应用图标 + 托盘两态
+// 图标源 = scripts/assets/app-icon-source.png（Trae CN 官方 logo 提取 + 白底蓝色 recolor，512x512）
 // 用法: node scripts/gen-icons.mjs
-import { deflateSync } from "node:zlib";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { inflateSync, deflateSync } from "node:zlib";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const OUT = path.resolve("src-tauri/icons");
+const SOURCE = path.resolve("scripts/assets/app-icon-source.png");
 mkdirSync(OUT, { recursive: true });
 
 // ── PNG 编码（RGBA8） ──
@@ -50,63 +52,145 @@ function encodePng(w, h, rgba) {
   ]);
 }
 
-// ── 图标绘制 ──
+// ── 源图：解码 + 双线性缩放 ──
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
 const smooth = (edge0, edge1, x) => {
   const t = clamp01((x - edge0) / (edge1 - edge0));
   return t * t * (3 - 2 * t);
 };
-const distSeg = (px, py, x1, y1, x2, y2) => {
-  const dx = x2 - x1, dy = y2 - y1;
-  const L2 = dx * dx + dy * dy || 1e-9;
-  let t = ((px - x1) * dx + (py - y1) * dy) / L2;
-  t = Math.max(0, Math.min(1, t));
-  const gx = x1 + t * dx - px, gy = y1 + t * dy - py;
-  return Math.hypot(gx, gy);
-};
+
+function decodePng(buf) {
+  let off = 8;
+  let w = 0, h = 0, depth = 0, type = 0, interlace = 0;
+  let palette = null;
+  const idats = [];
+  while (off < buf.length) {
+    const len = buf.readUInt32BE(off);
+    const typeStr = buf.subarray(off + 4, off + 8).toString("ascii");
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (typeStr === "IHDR") {
+      w = data.readUInt32BE(0);
+      h = data.readUInt32BE(4);
+      depth = data[8];
+      type = data[9];
+      interlace = data[12];
+    } else if (typeStr === "PLTE") {
+      palette = Buffer.from(data);
+    } else if (typeStr === "IDAT") {
+      idats.push(data);
+    } else if (typeStr === "IEND") break;
+    off += 12 + len;
+  }
+  if (depth !== 8) throw new Error(`unsupported bit depth ${depth}`);
+  if (interlace !== 0) throw new Error("interlaced png unsupported");
+  const channels = type === 6 ? 4 : type === 2 ? 3 : type === 3 ? 1 : null;
+  if (!channels) throw new Error(`unsupported color type ${type}`);
+  const raw = inflateSync(Buffer.concat(idats));
+  const stride = w * channels;
+  const px = Buffer.alloc(w * h * 4);
+  const paeth = (a, b, c) => {
+    const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  };
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)];
+    const line = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    const cur = Buffer.alloc(stride);
+    for (let i = 0; i < stride; i++) {
+      const x = line[i];
+      const a = i >= channels ? cur[i - channels] : 0;
+      const b = prev[i];
+      const c = i >= channels ? prev[i - channels] : 0;
+      cur[i] =
+        f === 0 ? x : f === 1 ? x + a : f === 2 ? x + b : f === 3 ? x + ((a + b) >> 1) : x + paeth(a, b, c);
+    }
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4;
+      if (type === 6) {
+        px[o] = cur[x * 4]; px[o + 1] = cur[x * 4 + 1]; px[o + 2] = cur[x * 4 + 2]; px[o + 3] = cur[x * 4 + 3];
+      } else if (type === 2) {
+        px[o] = cur[x * 3]; px[o + 1] = cur[x * 3 + 1]; px[o + 2] = cur[x * 3 + 2]; px[o + 3] = 255;
+      } else {
+        const pi = cur[x] * 3;
+        px[o] = palette[pi]; px[o + 1] = palette[pi + 1]; px[o + 2] = palette[pi + 2]; px[o + 3] = 255;
+      }
+    }
+    prev = cur;
+  }
+  return { w, h, rgba: px };
+}
+
+function resizeBilinear(src, size) {
+  const out = Buffer.alloc(size * size * 4);
+  const { w, h, rgba } = src;
+  for (let y = 0; y < size; y++) {
+    const gy = ((y + 0.5) / size) * h - 0.5;
+    const y0 = Math.max(0, Math.min(h - 1, Math.floor(gy)));
+    const y1 = Math.min(h - 1, y0 + 1);
+    const fy = gy - Math.floor(gy);
+    for (let x = 0; x < size; x++) {
+      const gx = ((x + 0.5) / size) * w - 0.5;
+      const x0 = Math.max(0, Math.min(w - 1, Math.floor(gx)));
+      const x1 = Math.min(w - 1, x0 + 1);
+      const fx = gx - Math.floor(gx);
+      const o = (y * size + x) * 4;
+      for (let c = 0; c < 4; c++) {
+        const p00 = rgba[(y0 * w + x0) * 4 + c];
+        const p01 = rgba[(y0 * w + x1) * 4 + c];
+        const p10 = rgba[(y1 * w + x0) * 4 + c];
+        const p11 = rgba[(y1 * w + x1) * 4 + c];
+        out[o + c] = Math.round(
+          p00 * (1 - fx) * (1 - fy) + p01 * fx * (1 - fy) + p10 * (1 - fx) * fy + p11 * fx * fy,
+        );
+      }
+    }
+  }
+  return out;
+}
+
+const SOURCE_IMG = decodePng(readFileSync(SOURCE));
+if (SOURCE_IMG.w !== SOURCE_IMG.h) throw new Error("icon source must be square");
+
+// 反色源：蓝底 + 白色图形。≤48px 的场景（窗口标题栏 16px / 托盘 32px）白底蓝图形
+// 会糊成一团无法辨认（2026-09-29 用户反馈），小尺寸统一用反色版。
+function invertSource(src) {
+  const out = Buffer.from(src.rgba);
+  const lum = (r, g, b) => 0.299 * r + 0.587 * g + 0.114 * b;
+  for (let i = 0; i < out.length; i += 4) {
+    if (out[i + 3] === 0) continue;
+    // 白(255)→0 映射为蓝底；蓝(≈96)→1 映射为白图形；中间为抗锯齿过渡
+    const t = Math.max(0, Math.min(1, (255 - lum(out[i], out[i + 1], out[i + 2])) / (255 - 96)));
+    out[i] = Math.round(BLUE[0] + (255 - BLUE[0]) * t);
+    out[i + 1] = Math.round(BLUE[1] + (255 - BLUE[1]) * t);
+    out[i + 2] = Math.round(BLUE[2] + (255 - BLUE[2]) * t);
+  }
+  return { w: src.w, h: src.h, rgba: out };
+}
+const BLUE = [0x25, 0x63, 0xeb];
+const INVERTED_SRC = invertSource(SOURCE_IMG);
 
 /**
- * 画一个"圆角方块 + 白色对勾"图标；redDot 时右上角加红点
- * 底色 teal #0D9488，红点 #EF4444
+ * 画应用图标：>48px 用白底蓝 logo（桌面/文件属性），≤48px 用蓝底白图形反色版
+ * （窗口标题栏 16px / 托盘 32px，保证小尺寸可辨识）；redDot 时右上角加红点（托盘未签态）
  */
 function renderIcon(size, { redDot = false } = {}) {
-  const px = Buffer.alloc(size * size * 4);
+  const px = resizeBilinear(size <= 48 ? INVERTED_SRC : SOURCE_IMG, size);
   const s = size;
-  const cx = s / 2, cy = s / 2;
-  const r = s * 0.46;                    // 圆角半径度量
-  const corner = s * 0.22;               // 圆角
-  const setPx = (i, [R, G, B, A]) => {
-    const a = A / 255;
-    px[i] = Math.round(R * a + px[i] * (1 - a));
-    px[i + 1] = Math.round(G * a + px[i + 1] * (1 - a));
-    px[i + 2] = Math.round(B * a + px[i + 2] * (1 - a));
-    px[i + 3] = Math.max(px[i + 3], A);
-  };
-  for (let y = 0; y < s; y++) {
-    for (let x = 0; x < s; x++) {
-      const i = (y * s + x) * 4;
-      // 到圆角方形内部的符号距离（简化：超椭圆/圆角处理）
-      const nx = Math.abs(x + 0.5 - cx), ny = Math.abs(y + 0.5 - cy);
-      const qx = Math.max(nx - (s / 2 - corner), 0);
-      const qy = Math.max(ny - (s / 2 - corner), 0);
-      const d = Math.hypot(qx, qy) - corner; // >0 在外
-      const alpha = Math.round(255 * (1 - smooth(-0.7, 0.7, d)));
-      if (alpha > 0) setPx(i, [0x0d, 0x94, 0x88, alpha]);
-      // 白色对勾（全部使用归一化 0..1 坐标）
-      const u = (x + 0.5) / s, v = (y + 0.5) / s;
-      const w = 0.085;
-      const dCheck = Math.min(
-        distSeg(u, v, 0.28, 0.53, 0.44, 0.68),
-        distSeg(u, v, 0.44, 0.68, 0.72, 0.34),
-      );
-      const aCheck = Math.round(255 * (1 - smooth(w * 0.55, w * 0.85, dCheck)));
-      if (aCheck > 0) setPx(i, [255, 255, 255, aCheck]);
-      // 红点（托盘未签状态）
-      if (redDot) {
-        const dxr = (x + 0.5 - s * 0.78) , dyr = (y + 0.5 - s * 0.22);
+  if (redDot) {
+    for (let y = 0; y < s; y++) {
+      for (let x = 0; x < s; x++) {
+        const i = (y * s + x) * 4;
+        const dxr = x + 0.5 - s * 0.78, dyr = y + 0.5 - s * 0.22;
         const dr = Math.hypot(dxr, dyr) - s * 0.16;
         const aDot = Math.round(255 * (1 - smooth(-0.7, 0.7, dr)));
-        if (aDot > 0) setPx(i, [0xef, 0x44, 0x44, aDot]);
+        if (aDot > 0) {
+          const a = aDot / 255;
+          px[i] = Math.round(0xef * a + px[i] * (1 - a));
+          px[i + 1] = Math.round(0x44 * a + px[i + 1] * (1 - a));
+          px[i + 2] = Math.round(0x44 * a + px[i + 2] * (1 - a));
+          px[i + 3] = Math.max(px[i + 3], aDot);
+        }
       }
     }
   }
@@ -144,4 +228,7 @@ writeFileSync(path.join(OUT, "32x32.png"), renderIcon(32));
 writeFileSync(path.join(OUT, "icon.ico"), makeIco([[256, renderIcon(256)], [32, renderIcon(32)]]));
 writeFileSync(path.join(OUT, "tray-normal.png"), renderIcon(32));
 writeFileSync(path.join(OUT, "tray-red.png"), renderIcon(32, { redDot: true }));
+// 同步一份到前端 public/，供侧边栏 logo 引用（与桌面图标同源）
+mkdirSync(path.resolve("public"), { recursive: true });
+writeFileSync(path.resolve("public/app-icon.png"), readFileSync(path.join(OUT, "icon.png")));
 console.log("icons written to", OUT);

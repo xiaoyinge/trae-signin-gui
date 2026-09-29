@@ -12,9 +12,9 @@ pub struct LoginParams {
     pub port: u16,
     /// 32 位 hex，每账号独立生成并随凭证保存
     pub machine_id: String,
-    /// 32 位 hex，每账号独立生成并随凭证保存
+    /// 16 位纯数字 Aha 设备号（`gen_device_id` 生成），每账号独立生成并随凭证保存
     pub device_id: String,
-    /// 32 位 hex 追踪 id；同时作为回调 `state`（OAuth 防注入绑定，PLAN §10 #7）
+    /// 32 位 hex 追踪 id；上游回调时以 `loginTraceID` 原样带回，作为防注入比对值（PLAN §10 #7）
     pub login_trace_id: String,
 }
 
@@ -23,11 +23,14 @@ pub const PLUGIN_VERSION: &str = "2.3.62834";
 
 /// 生成登录链接（query 顺序与上游一致）
 ///
-/// `auth_callback_url` 内拼 `state={login_trace_id}`：上游原样跳转回我们的回调服务，
-/// 服务端严格比对后再处理（防本机任意来源注入凭证）。
+/// `login_trace_id` 随登录 URL 发起，上游回调时以 `loginTraceID` **原样带回**（2026-09-29
+/// 实测），作为回调防注入比对值。PLAN §10 #7 的修正：原方案把 `state` 拼进
+/// `auth_callback_url`，但上游授权页**不接受带 query 的回调地址**（页面直接报
+/// 「登录失败/网络错误」，2026-09-29 实验 B 实锤），故回调地址回归纯
+/// `http://127.0.0.1:{port}/authorize`，比对改走上游自带的 loginTraceID 回传通道——
+/// 防注入强度不变：该值 128 位熵，只存在于本机会话与登录 URL 中，伪造回调无从得知。
 pub fn build_login_url(p: &LoginParams) -> String {
-    let callback =
-        format!("http://127.0.0.1:{}/authorize?state={}", p.port, p.login_trace_id);
+    let callback = format!("http://127.0.0.1:{}/authorize", p.port);
     format!(
         "{LOGIN_BASE_URL}?login_version=1&auth_from=solo&login_channel=native_ide\
 &plugin_version={PLUGIN_VERSION}&auth_type=local&client_id={}&redirect=0\
@@ -61,9 +64,61 @@ pub fn gen_device_id() -> String {
     n.to_string()
 }
 
-/// deviceId 是否符合官方 Aha 设备号格式（16 位纯数字）
+/// deviceId 是否符合官方 Aha 设备号形态：纯数字、12~20 位。
+///
+/// 2026-09-29 从「严格 16 位」放宽（PLAN §9）：社区实测存在 **15 位真号**
+/// （吾爱破解 tid=2130100 v1.1——那台机器 `storage.json` 里就是 15 位），旧实现会把
+/// 它判非法并静默替换成随机生成号；若账号已绑定原真号，替换后的新号 claim 一律
+/// 9074，等于把能用的号弄坏。「16 位」是观察不是规则，12~20 与该帖防呆边界一致。
+/// 32 位 hex UUID 仍不合法（claim 会 9074，见 `upstream` 的 `ensure_device_id_format`）。
 pub fn is_valid_device_id(d: &str) -> bool {
-    d.len() == 16 && d.bytes().all(|b| b.is_ascii_digit())
+    (12..=20).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 从 TRAE 客户端 `storage.json` 文本中提取真实设备号。
+///
+/// 号写在**键名**上：`iCubeAuthInfo://icube-dc:{12~20位数字}`（无需解密，2026-09-29 实测）。
+/// 值一律忽略（其中可能含 token）。解析失败 / 无命中 → 空列表。
+pub fn extract_device_ids_from_storage_json(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(obj) = v.as_object() {
+        for k in obj.keys() {
+            if let Some(d) = k.strip_prefix("iCubeAuthInfo://icube-dc:") {
+                let d = d.trim();
+                if is_valid_device_id(d) && !out.iter().any(|x: &String| x == d) {
+                    out.push(d.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 探测本机 TRAE 客户端（CN 版 / 国际版）的 storage.json 并提取真实设备号。
+///
+/// 未安装 / 未登录 / 文件异常 → 空列表。调用方自行决定采用策略
+/// （唯一号可自动填入；多号无法判定归属，应交由用户手动选择）。
+pub fn detect_client_device_ids() -> Vec<String> {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return Vec::new();
+    };
+    for dir in ["Trae CN", "Trae"] {
+        let path = std::path::Path::new(&appdata)
+            .join(dir)
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let ids = extract_device_ids_from_storage_json(&text);
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// 生成 32 位 hex trace id，同时充当回调 state：
@@ -226,13 +281,11 @@ mod tests {
         assert!(url.contains("auth_type=local"));
         assert!(url.contains("redirect=0"));
         assert!(url.contains(&format!("login_trace_id={}", p.login_trace_id)));
-        // state 绑定：回调 URL 内必须携带 state（PLAN §10 #7）
+        // 回调地址不带 query：上游授权页不接受带 ?state= 的回调地址（2026-09-29 实验 B 实锤），
+        // 防注入比对走 login_trace_id 参数（回调以 loginTraceID 原样带回）
         assert!(url.contains(&format!(
             "auth_callback_url={}",
-            urlencode(&format!(
-                "http://127.0.0.1:18080/authorize?state={}",
-                p.login_trace_id
-            ))
+            urlencode("http://127.0.0.1:18080/authorize")
         )));
         assert!(url.contains("machine_id=m123"));
         assert!(url.contains("device_id=d123"));
@@ -299,10 +352,43 @@ mod tests {
             let n: u128 = d.parse().unwrap();
             assert!((1_000_000_000_000_000..10_000_000_000_000_000).contains(&n));
         }
+    }
+
+    /// 设备号形态边界（2026-09-29 放宽，PLAN §9）：
+    /// 15 位真号实测存在（tid=2130100 v1.1），不得再被误杀；32 位 hex 仍不合法。
+    #[test]
+    fn device_id_format_boundaries() {
         // 32 位 hex UUID 形态必须被判为不合法（9074 风控触发形态）
         assert!(!is_valid_device_id("1942097ad2664caeb07cd7a4a6446a57"));
         assert!(!is_valid_device_id(""));
-        assert!(!is_valid_device_id("12345678901234567"));
+        // 15 位真号（旧实现误杀）
+        assert!(is_valid_device_id("123456789012345"));
+        // 17 位纯数字（旧实现同样误杀）
+        assert!(is_valid_device_id("12345678901234567"));
+        // 防呆边界 12~20
+        assert!(is_valid_device_id("123456789012"));
+        assert!(is_valid_device_id("12345678901234567890"));
+        assert!(!is_valid_device_id("12345678901"));
+        assert!(!is_valid_device_id("123456789012345678901"));
+        // 含非数字不合法
+        assert!(!is_valid_device_id("123456789012345a"));
+    }
+
+    /// 从客户端 storage.json 提取设备号：键名 `iCubeAuthInfo://icube-dc:{号}`（2026-09-29 实测形态）
+    #[test]
+    fn extract_client_device_ids_from_storage() {
+        let text = r#"{
+            "iCubeAuthInfo://icube-dc:1112223334445566": "{\"token\":\"...\"}",
+            "other.key": 1,
+            "iCubeAuthInfo://icube-dc: 1112223334445566 ": "dup-with-spaces",
+            "iCubeAuthInfo://icube-dc:1942097ad2664caeb07cd7a4a6446a57": "hex-ignored"
+        }"#;
+        assert_eq!(
+            extract_device_ids_from_storage_json(text),
+            vec!["1112223334445566"]
+        );
+        assert!(extract_device_ids_from_storage_json("not json").is_empty());
+        assert!(extract_device_ids_from_storage_json("{}").is_empty());
     }
 
     #[test]
