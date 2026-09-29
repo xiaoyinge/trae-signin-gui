@@ -80,6 +80,8 @@ pub struct AppState {
     pub sched_daily_retry: StdMutex<Option<DailyRetry>>,
     /// 启动补签是否已执行
     pub startup_done: StdMutex<bool>,
+    /// 今日缓存对应的日期（跨天清空 `today` 的依据，见 `rollover_today_cache`）
+    pub cache_date: StdMutex<Option<chrono::NaiveDate>>,
 }
 
 impl AppState {
@@ -102,6 +104,7 @@ impl AppState {
             sched_last_periodic: StdMutex::new(None),
             sched_daily_retry: StdMutex::new(None),
             startup_done: StdMutex::new(false),
+            cache_date: StdMutex::new(None),
         }
     }
 
@@ -172,6 +175,24 @@ pub fn launched_hidden() -> bool {
     std::env::args().any(|a| a == "--hidden" || a == "-hidden")
 }
 
+/// 跨天滚动：昨日残留的今日缓存（Ok/Already/Disabled）若不清空，跨天后所有
+/// skip_signed 轮（定点/周期/手动全部签到）都会把昨天当成今天而跳过——
+/// 应用常驻跨天是主场景，等于自动签到静默失效一整天，托盘还亮绿点。
+/// 启动首轮（cache_date=None）只记日期不清缓存：setup 时 `restore_today_from_history`
+/// 已按 is_today 过滤，缓存里本来就只有今日记录。
+/// **调用方必须已持有 signin_lock**（与轮内 update_today 串行）。
+pub fn rollover_today_cache(state: &AppState) {
+    let today = chrono::Local::now().date_naive();
+    let mut d = state.cache_date.lock().unwrap();
+    if *d == Some(today) {
+        return;
+    }
+    if d.is_some() {
+        state.today.lock().unwrap().clear();
+    }
+    *d = Some(today);
+}
+
 /// 从历史恢复今日缓存（启动时调用：避免重启后丢失"今日已签"判断）
 pub fn restore_today_from_history(state: &AppState) {
     let Some(dir) = state.current_data_dir() else {
@@ -181,12 +202,15 @@ pub fn restore_today_from_history(state: &AppState) {
         return;
     };
     // 今日记录按时间升序重放，最后一条生效。
+    // read_recent 返回时间**降序**（最新在前），必须反转后重放：
+    // 否则最早一条（如失败）会覆盖最新一条（如成功），重启后状态回退。
     // 用 core 的 is_today 过滤（M9/L6 修复：旧实现构造"今日零点"时间戳，
     // 本地午夜不存在的时区下 `.single()` 为 None → today_start=0 → 回放整个历史文件当"今日"）。
     let now_local = chrono::Local::now();
     let mut latest: HashMap<String, &trae_signin_core::history::HistoryEntry> = HashMap::new();
     for e in entries
         .iter()
+        .rev()
         .filter(|e| trae_signin_core::scheduler::is_today(e.ts, now_local))
     {
         latest.insert(e.uid.clone(), e);
@@ -209,4 +233,93 @@ pub fn restore_today_from_history(state: &AppState) {
 /// 便捷：获取 app state
 pub fn state(app: &tauri::AppHandle) -> &AppState {
     app.state::<AppState>().inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trae_signin_core::history::{append_entry, HistoryEntry};
+
+    fn test_state_with_dir(dir: &std::path::Path) -> AppState {
+        let st = AppState::new();
+        *st.data_dir.lock().unwrap() = Some(dir.to_path_buf());
+        st
+    }
+
+    fn write_history(dir: &std::path::Path, ts: i64, status: CheckinStatus) {
+        append_entry(
+            dir,
+            &HistoryEntry {
+                ts,
+                uid: "u-1".into(),
+                nickname: "测试".into(),
+                status,
+                credits: None,
+                message: "m".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// 同一账号今日有多条记录（先失败后成功）时，必须恢复**最新**一条。
+    /// read_recent 返回时间降序，重放必须反转；旧实现降序遍历直接 insert，
+    /// 最早的 Failed 覆盖了最新的 Ok，重启后托盘误亮红点、定时轮重复 claim。
+    #[test]
+    fn restore_replays_latest_entry_per_uid() {
+        let dir = std::env::temp_dir().join(format!("tstate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = test_state_with_dir(&dir);
+        let now = chrono::Local::now().timestamp();
+        write_history(&dir, now - 100, CheckinStatus::Failed);
+        write_history(&dir, now - 10, CheckinStatus::Ok);
+        restore_today_from_history(&st);
+        assert_eq!(
+            st.today.lock().unwrap().get("u-1").map(|t| t.status),
+            Some(CheckinStatus::Ok),
+            "恢复的必须是最新一条（Ok），而不是最早的 Failed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跨天滚动：昨日残留的今日缓存必须清空（自动签到被昨日状态跳过一整天的根源）。
+    #[test]
+    fn rollover_clears_cache_on_date_change() {
+        let st = AppState::new();
+        let yesterday = chrono::Local::now().date_naive() - chrono::Duration::days(1);
+        // 模拟昨日状态：cache_date 指向昨天 + 缓存里有"已签"
+        *st.cache_date.lock().unwrap() = Some(yesterday);
+        st.update_today(
+            "u-1",
+            TodayState {
+                status: CheckinStatus::Ok,
+                ..Default::default()
+            },
+        );
+        super::rollover_today_cache(&st);
+        assert!(st.today.lock().unwrap().get("u-1").is_none(), "跨天后昨日缓存必须清空");
+        assert_eq!(
+            *st.cache_date.lock().unwrap(),
+            Some(chrono::Local::now().date_naive())
+        );
+    }
+
+    /// 同一天内重复滚动不得清缓存（否则周期检查刚写的结果会被下一轮抹掉）。
+    #[test]
+    fn rollover_is_noop_within_same_day() {
+        let st = AppState::new();
+        st.update_today(
+            "u-1",
+            TodayState {
+                status: CheckinStatus::Ok,
+                ..Default::default()
+            },
+        );
+        super::rollover_today_cache(&st);
+        super::rollover_today_cache(&st);
+        assert_eq!(
+            st.today.lock().unwrap().get("u-1").map(|t| t.status),
+            Some(CheckinStatus::Ok),
+            "同一天内滚动是无操作"
+        );
+    }
 }

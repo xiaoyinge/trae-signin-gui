@@ -266,8 +266,15 @@ pub fn list_accounts(app: AppHandle) -> Vec<AccountView> {
 }
 
 #[tauri::command]
-pub fn import_credential(app: AppHandle, json: String) -> Result<ImportResult, String> {
+pub async fn import_credential(app: AppHandle, json: String) -> Result<ImportResult, String> {
     let st = state(&app);
+    // 与签到/刷新/保活轮互斥（与 delete_account/set_device_id 同纪律）：
+    // 轮内凭证回写（token 刷新、deviceId 迁移）会覆盖刚导入的同 uid 凭证文件，
+    // 重导场景下等于导入被旧数据冲掉。
+    let _guard = match st.signin_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Err("签到进行中，请稍后再试".into()),
+    };
     let r = crate::login_service::import_credential_text(st, &json)?;
     update_tray(&app);
     let _ = app.emit("accounts://changed", ());
@@ -417,6 +424,10 @@ pub async fn run_signin_round(
             }
         }
     };
+
+    // 跨天滚动：清掉昨日残留的"今日缓存"，否则跨天后所有 skip_signed 轮
+    // 都会把昨天当成今天而跳过（自动签到静默失效一整天）
+    crate::state::rollover_today_cache(st);
 
     let dir = st.current_data_dir().ok_or("数据目录未初始化")?;
     let mut creds = trae_signin_core::auth::list_credentials(&dir)
@@ -614,6 +625,8 @@ pub async fn run_refresh_round_inner(
     uids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let st = state(app);
+    // 两个调用方（刷新轮/保活轮）都持锁；跨天滚动与签到轮同理由（见 run_signin_round）
+    crate::state::rollover_today_cache(st);
     let dir = st.current_data_dir().ok_or("数据目录未初始化")?;
     let mut creds = trae_signin_core::auth::list_credentials(&dir)
         .map_err(|e| format!("读取凭证失败: {e}"))?;

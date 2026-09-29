@@ -260,6 +260,11 @@ async fn run_callback_server(
 /// 单次固定 8192 读会把 query 截断成残缺凭证；读到 `\r\n\r\n` 为止，超过即 413。
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// 单次 read 的空闲上限：连接建立后迟迟不发数据的连接（杀软/扫描器探测、
+/// 残留 keep-alive）若无限等待，会把 accept 循环挂死到 5 分钟登录超时，
+/// 真实回调永远排不上队。正常浏览器请求头毫秒级到达，10s 绰绰有余。
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 等待 /authorize 回调，返回**已通过校验**的 query string。
 ///
 /// 防护（PLAN §10 #7，2026-09-29 修正传递通道）：
@@ -298,10 +303,19 @@ async fn wait_authorize(
                 log::warn!("回调请求超过 {MAX_REQUEST_BYTES} 字节，已拒绝（等待真实回调中）");
                 break;
             }
-            let n = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|e| format!("读取请求失败: {e}"))?;
+            let n = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.read(&mut chunk)).await {
+                // 对端 RST/中断同样只弃该连接：让单个坏连接终止整个登录会话的话，
+                // 本机任意进程 connect 后立即 RST 就能废掉 5 分钟登录窗口
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    log::warn!("回调连接读取失败（{e}），已丢弃（等待真实回调中）");
+                    break;
+                }
+                Err(_) => {
+                    log::warn!("回调连接 {READ_IDLE_TIMEOUT:?} 未发送请求数据，已丢弃（等待真实回调中）");
+                    break;
+                }
+            };
             if n == 0 {
                 break;
             }
