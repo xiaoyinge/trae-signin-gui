@@ -80,6 +80,12 @@ pub enum CoreError {
     Http(#[from] reqwest::Error),
     #[error("认证失效（需重新登录）: {0}")]
     AuthExpired(String),
+    /// 上游拒绝该账号当前使用的设备号（claim `code=9074`，文案伪装成「参与用户太多」）。
+    ///
+    /// **不是网络/超时，也不是拥塞**：同号重试必然再拒，正确处置是换一个真机码形态的
+    /// 设备号再签（`Upstream::signin_account` 会自动做），因此**不进**重试白名单。
+    #[error("设备号未被上游认可: {0}")]
+    DeviceRejected(String),
     #[error("可重试错误（网络/超时）: {0}")]
     Retryable(String),
     #[error("{0}")]

@@ -69,15 +69,16 @@
   3. `HTTP 2xx` + 其余 → 成功（对齐 Go `doJSON`：它从不解析响应体）
   > 注意两个曾被当作"事实"的错判：旧实现把规则 2 的响应记成**不可重试的失败**（用户只能手动补签）；把它改成"2xx 即成功"则会记成**假成功**（积分没到账却显示已签）。两条路都错，正解是重试。
   > 规则 2 原先还要求 `code != 0`；`code: 0` 或无 `code` 字段回同样文案时仍会记假成功，故已去掉该前置条件。**不得**把匹配范围扩到原始响应体：成功报文里可能带 `needRetry` 之类的键，而特征表含 `retry`。
-- **实测拥塞响应体**（2026-09-16 08:47 `app.log`，HTTP 200）：`{"code":9074,"message":"当前参与用户太多，请稍后再试"}` —— 仅此两字段，无 `data` 包装。**2026-09-23 起已按 code 白名单判定（`CONGESTION_CODES`，`9074` 起步），文案匹配退为兜底（并集）**；每核实一个新 code 就补进本节与白名单。白名单只能自建：上游 `Maquer/trae-signin` 的 `doJSON` 从不解析响应体（同一条 9074 在它那里打印 `✅ OK`）
+- **9074 = 设备号未被上游认可，不是拥塞**（2026-11-03 定名 `DEVICE_REJECTED_CODE`，已从 `CONGESTION_CODES` 移出）。实测响应体（2026-09-16 08:47 `app.log`，HTTP 200）：`{"code":9074,"message":"当前参与用户太多，请稍后再试"}`——文案是幌子，真因是 `X-Device-Id` 没过服务端设备校验（生成号过不了新账号首次绑定 / 该号已被别的账号占用）。**同号重试必然再拒**，故：① 不进瞬时重试白名单（`with_ug_retry` 不重试）；② `checkin_claim_once` 里**先于**拥塞文案判定（「稍后」会被文案兜底误命中）；③ `signin_account` 自动换号（`login::rotate_device_id`）后**只重试一次**，仍拒则如实报错（继续换号只会污染凭证）。Go 参考实现的 `doJSON` 从不解析响应体（同一条 9074 在它那里打印 `✅ OK`），白名单/定性只能自建
 - 判定性字段（`code`/`checkedIn`/`enable`）取值优先序：**顶层 → `data` 包装 → 全树递归**，避免兄弟子树按字典序抢先命中
 - UG 瞬时错误按 `retry_backoff * 2^n` + 抖动重试，共 `UG_ATTEMPTS = 2` 次（基础退避 **20s**；`with_retry_backoff` 可注入，测试置 0）。2026-09-16 从「3 次 / 2s」收紧：9074 的实测行为更像**按客户端限流**（同账号同 IP，客户端三连拒后 1 分钟人工补签即成功），秒级密集重试等于在同一个拒绝窗口里自激
+- **设备号自动分配**（2026-11-03 落地，代码见 `login::assign_device_id` / `rotate_device_id`）：新账号**不再需要用户自己去 `storage.json` 找号**。规则：① 已有合法设备号的账号原样沿用（绝不轮换已验证的绑定）；② 新账号取本机客户端真机码；③ 该真机码已被其它账号占用 → **同源衍生**（前缀不变、末 4 位递增，形态与位数完全保持真机码形态）→ 与原有账号分开；④ 没装客户端 → 本机指纹（`COMPUTERNAME|USERNAME|APPDATA` FNV-1a）稳定推导，跨重启不变。登录链接里的 `device_id` 在**打开浏览器之前**就分配好，落盘凭证沿用同一个号；导入凭证与签到前迁移（非法形态）走同一套分配。**9074 触发时自动换号并重试一次**，换号限频为**同账号每 24h 一次**（`deviceRotatedAt`），防止被拒账号每轮换号把凭证刷成随机数；手动 `set_device_id` 会把该时间戳清零，让用户改完号后还能再拿到一次自动兜底。撞号判定只有一份实现：`login::device_id_owner(uid, device_id, creds)`（空号不算占用），手动设置时撞号**不阻塞但记 warn**——一台设备一天只能签一个账号，撞号的另一个会得 9095。
 - **设备号 / 账号-设备绑定**（2026-09-29 登记；来源：吾爱破解 tid=2130100 实测帖 + 本机 `app.log` 铁证）：
   - 本机证据：唯一账号 2026-09-16 11:13 由 32-hex **迁移为随机生成的 16 位号**（app.log「已迁移为 16 位数字 Aha 设备号」），此后未再 OAuth 登录，09-17 起每日 claim `code=0` → **「生成的号必然 9074」不成立**，那帖的强断言与本机实测直接矛盾
   - 那帖对照实验：同账号同一时刻，自生成 16 位号 → 9074；客户端 `storage.json` 里的真号 → 9095。与本机证据合并后的最优解释：**账号与设备存在绑定关系**（首个有效请求先到先得），绑定设备可签、非绑定设备 9074——解释力高于「必须真实注册」，但两条都未复现实验，仅作工作假设
   - `did_checked_in` 是**设备维度**字段（那帖）：一台设备一天只算一个账号，第二个账号 claim 回 `{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}`——**非拥塞、重试无用**。本实现已拦截（2026-09-29）：`code=9095` → 终局 `Failed` 不重试，HTTP 状态码未知故 200/4xx 两路径都拦（`DEVICE_ALREADY_SIGNED_CODE`，§9 已修）
   - 「必须 16 位」是观察不是规则：**15 位真号存在**（那帖 v1.1 修正的就是这个）。本实现已放宽（2026-09-29）：合法形态 = 纯数字 **12~20 位**（`is_valid_device_id`），15/17 位真号不再被迁移替换（§9 已修）
-- 积分 = `sum(user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit)`；**f64 保留上游原始精度**（2026-09-23 拍板 #11，不再 `as i64` 截断小数）
+- 积分余额 = `usage_summary.total_amount - usage_summary.consumed_amount`（**2026-11-03 改口径**）：`credits_limit` 是**名义额度**，签到每天新增 100 分包只增不减、对话消耗不写回它，旧口径因此只涨不落，与 TRAE 客户端显示的余额越用差越多；`usage_summary` 才是服务端账本（`total_amount` 已发放总额 − `consumed_amount` 已消耗 = 客户端显示的可用余额）。缺 `usage_summary` 或其关键字段 → `query_credits` 返回 `Err`，调用方 `.ok()` 显示「积分未知」，**不得**退回名义额度累加。**f64 保留上游原始精度**（2026-09-23 拍板 #11，不再 `as i64` 截断小数）
 - 刷新缓冲 2 小时（`expiresAt - now <= 2h` 即刷新）
 
 **登录链接**（`https://www.trae.cn/authorization?` + query）
@@ -85,7 +86,7 @@
 `login_version=1, auth_from=solo, login_channel=native_ide, plugin_version=2.3.62834, auth_type=local, client_id, redirect=0, login_trace_id=<hex32>, auth_callback_url=http://127.0.0.1:{port}/authorize?state={login_trace_id}, machine_id, device_id, x_device_id, x_machine_id, x_device_brand=PC, x_device_type=PC, x_os_version=1.0, x_app_version=0.1.43, x_app_type=stable`
 
 - `machine_id`：32 位 hex（Rust 用 `Uuid::new_v4().simple()`），每账号独立生成并随凭证保存
-- `device_id`：**16 位纯数字**（2026-09-16 起，`login.rs` · `gen_device_id`；旧文档写 32 位 hex 已过时，32-hex 形态会被 claim 9074 拒绝），每账号独立生成并随凭证保存
+- `device_id`：**纯数字 12~20 位**（Aha 设备号形态；32-hex 会被 claim 9074 拒绝）。2026-11-03 起**不再随机生成**，由 `login::assign_device_id` 统一分配并随凭证保存：已有合法号沿用 → 本机客户端真机码 → 被占则同源衍生（前缀不变、末 4 位递增）→ 无客户端则本机指纹推导（`COMPUTERNAME|USERNAME|APPDATA` FNV-1a，跨重启稳定）。`gen_device_id` 退为兜底。**一个设备号一天只能签一个账号**（撞号回 9095），故分配必须避让已占用号（`login::device_id_owner` 是唯一判定实现）
 - `login_trace_id`：32 位 hex，**防注入比对值（PLAN §10 #7，2026-09-29 修正传递通道）**：原方案把它作 `state` 拼进 `auth_callback_url`，真实登录实测上游授权页**不接受带 query 的回调地址**（页面报「登录失败/网络错误」，实验 B 去掉 state 后授权流程走通，实锤）。现回调地址回归纯 `http://127.0.0.1:{port}/authorize`，比对改走回调 query 里上游**原样带回**的 `loginTraceID`——该值 128 位熵、只存在于本机会话与登录 URL，防注入强度不变
 - 回调 query 关键参数：`refreshToken`、`userInfo`（JSON：`UserID`/`ScreenName`）、`userJwt`（JSON：`Token`/`RefreshToken`/`TokenExpireAt`）、**`loginTraceID`**（上游原样带回发起时的 `login_trace_id`，防注入比对用）；另有 `isRedirect`/`scope`/`data`/`host`/`refreshExpireAt`/`userRegion` 等参数，宽容忽略（2026-09-29 真实登录实测）
 - 优先走 `refreshToken` → ExchangeToken；无 refreshToken 时用 `userJwt.Token` 兜底
@@ -315,6 +316,7 @@ AI-TraeQD/
 | ~~**刷新把「未签且可签」记成 Unknown + 上一轮进度文案残留**~~ ✅ **已修（2026-09-29）** | `commands.rs` · `run_refresh_round_inner`；`lib.rs` · `CheckinStatus`；前端 `STATUS_META` | ~~「全部刷新」对未签且 enable=true 的账号记 Unknown（徽章「未知」），叠加签到轮残留的 done 进度文案（如「完成：签到功能未启用（积分 0）」）造成误读~~。诱因：新账号开通暂态——实测上游对新账号+新设备号在开通后几分钟内返回 `enable:false`，随后恢复 `true`（取证日志 13:15:19 false → 13:16:12 true） | 新增 `CheckinStatus::NotSigned`（"未签"），刷新如实记录；刷新完成对每账号发 done 进度事件（「状态已刷新」+ 最新积分）覆盖残留；前端加「未签」徽章。注意：当天内被缓存 Disabled 的账号，签到轮仍会跳过（§10 #1 拍板行为）——上游开通暂态场景点一次「刷新」即解封；跨天缓存清零无残留 |
 | **status 每日 07:00 假阳性（推定）**（2026-09-29 新增） | `upstream.rs` · `checkin_status` | 2026-09-17~09-29 每日 07:00 定点轮**静默跳过**（claim 必落 INFO 日志而 07:00~07:49 无任何日志 → 推定 status 报已签走了 skip），随后 07:49~07:56 周期检查轮 claim 却成功 `code=0`（实际未签）→ **status 存在假阳性**，疑服务器日界/滚动窗口与本地 0 点不一致；tid=2130100 称 `did_checked_in` 是设备维度字段。单账号仅表现为签到时间漂移到 ~07:55，多账号同设备会把未签账号错误跳过 | **取证日志已加（2026-09-29）**：`checkin_status_once` 的 2xx 响应体整体 INFO 落 `app.log`（claim 同款），次日 07:00 假阳性时刻即可取证；字段路径与语义现形后硬编码并删树搜兜底（M8 惯例） |
 | 核心 `scheduler` 的 `next_daily_run`/`is_today` 无调用方 | `crates/trae-signin-core/src/scheduler.rs` | 壳层自己用 `now.time() >= daily` + 日期守卫重算了一套；有完整单测的 API 反而是死代码，两处逻辑将来会分叉。**2026-09-23 拍板（第 10 节 #9）**：壳层改用 core API，删壳层自算逻辑 |
+| ~~**进程运行一段时间后退出，无任何崩溃痕迹**~~ ✅ **已修（2026-09-30）** | `src-tauri/src/lib.rs` · `run` 回调；`state.rs` · `exiting`；`logger.rs` · `install_panic_hook`；`tray.rs` · `handle_close` | ~~`app.log` 多次出现「日志戛然而止、数小时后新实例启动」，WER/事件日志/Crashpad/Defender/Power 全无记录~~。根因定位：**Tauri 2 默认「最后一个窗口 Destroyed → 退出整个进程」**（`tauri-runtime-wry` lib.rs:4309 `TaoWindowEvent::Destroyed → is_empty → RunEvent::ExitRequested{code:None} → ControlFlow::Exit`）；用户点 X 已被 `CloseRequested` 拦截，能走到 Destroyed 的只剩 WebView2 进程死亡（Evergreen 运行时自动更新 / 系统资源回收），进程退出无任何崩溃痕迹与此吻合 | **修复**：`.run(callback)` 拦截 `ExitRequested{code:None}`——非 `exiting` 时 `prevent_exit` + 用 `WebviewWindowBuilder::from_config` 重建主窗口（visible:false 保持隐藏、托盘常驻、签到调度不受影响），build 失败带 5/15/45/120s 退避重试；`app.exit(0)` 路径（托盘退出 / `close_to_tray=false` 关窗）走 `Some(_)` 置 `exiting` 放行。`close_to_tray=false` 关窗显式 `app.exit(0)`（不放任 Destroyed）。**诊断网**：`logger::install_panic_hook`（panic=abort 下唯一取证通道）+ `WindowEvent::Destroyed` 留痕 + `RunEvent::Exit` 留痕（外部 TerminateProcess 强杀时 app.log 戛然而止、无 Exit 行）。**残留边界**：杀 webview2 子进程实测不触发 Destroyed（wry 把 webview 进程失败与窗口销毁分离、进程虽不死但窗口白屏；Tauri 2 `WebviewEvent` 仅暴露 `DragDrop`，webview 子进程单独死亡无法在 Tauri 层监听重建），但「进程退出」已被守卫拦住。`panic = "abort"` 仍在 release profile（体积决策），改它需用户拍板 |
 
 ### Low
 
@@ -348,7 +350,7 @@ AI-TraeQD/
 | 2 | 签到轮跳过 | 定时轮与「全部签到」按 `today` 缓存跳过 `ok/already/disabled`；`failed`/未知不跳过（重试） |
 | 3 | 部署陷阱工具化 | 新增 `scripts/build.ps1`：停进程 → `npm run tauri build` → 核对 exe LastWriteTime 前移 → 输出结论，失败即中止。**不含**启动环节 |
 | 4 | 静默轮 | 全部账号被跳过的轮零通知（系统通知与 Bark 均不发）；通知条件 = 「有真实 claim 或有失败账号」。前端进度流加「跳过」徽章，汇总显示 已签 x / 跳过 y / 失败 z |
-| 5 | 拥塞 code 白名单 | 从 `9074` 起步，文案匹配退为兜底（并集：任一命中即 Retryable）。上游 2026-09-22 有新提交但 `doJSON` 仍不解析响应体，白名单仍只能自建 |
+| 5 | 拥塞 code 白名单 | ~~从 `9074` 起步~~ **2026-11-03 修正：9074 是设备校验失败（`DeviceRejected`），已移出白名单**（当前 `CONGESTION_CODES = &[]`）。文案匹配保留为兜底（并集：任一命中即 Retryable），且 9074 判定必须**先于**文案兜底。上游若出现真限流 code，读到 `app.log` 原始响应体后再补白名单 |
 | 6 | tokenExpireDuration | **一律按秒解释**，毫秒归一化只属于 `TokenExpireAt` 时间戳分支（§9 原「`> 1e10` 才除 1000」方案无效——阈值分不出 7 天毫秒 6.05×10⁸，且秒/毫秒时长区间重叠）。与 Go `time.Duration(x) * time.Second` 一致 |
 | 7 | 登录三连修法 | H4：state 复用 `login_trace_id` 升 128 位（32 hex）拼进 `auth_callback_url`，回调严格比对 + 校验 Host + 拒绝非 GET，改完真实登录一次验证上游容忍度；H5：循环读至 `\r\n\r\n`、上限 64 KiB、解析失败（含字段缺失）一律上抛，删 `now+7d` 假过期兜底；H6+M1：删 `LAST_IDS_GLOBAL`，port+listener+ids+state 并入登录会话结构体（探测到的 listener 直接传递），保持单会话槽 |
 | 8 | 红点分母 | 托盘 `今日状态 x/y` 分母 = 全部账号**剔除 disabled**；红点亮灯 = 存在今日未签且未禁用账号；disabled 不再计入「已签」 |

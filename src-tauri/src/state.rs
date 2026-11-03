@@ -82,6 +82,10 @@ pub struct AppState {
     pub startup_done: StdMutex<bool>,
     /// 今日缓存对应的日期（跨天清空 `today` 的依据，见 `rollover_today_cache`）
     pub cache_date: StdMutex<Option<chrono::NaiveDate>>,
+    /// 主动退出流程进行中（托盘退出 / close_to_tray=false 关窗，即任何 `app.exit` 路径）。
+    /// 用于把「退出流程中顺带发生的窗口销毁」与「WebView2 意外死掉导致的窗口销毁」
+    /// 区分开：前者必须放行退出，后者要拦截退出并重建窗口（2026-09-30 修复）。
+    exiting: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -105,7 +109,18 @@ impl AppState {
             sched_daily_retry: StdMutex::new(None),
             startup_done: StdMutex::new(false),
             cache_date: StdMutex::new(None),
+            exiting: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 标记进入主动退出流程（run 回调在 `ExitRequested{code: Some(_)}` 时调用）
+    pub fn mark_exiting(&self) {
+        self.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 是否处于主动退出流程
+    pub fn is_exiting(&self) -> bool {
+        self.exiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn current_settings(&self) -> Settings {

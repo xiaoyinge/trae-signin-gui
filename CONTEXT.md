@@ -59,16 +59,52 @@ _Avoid_: 签到进度
 _Avoid_: 成功但有疑点
 
 **拥塞响应（congestion response）**:
-HTTP 2xx 但上游拒绝签到的响应（如「参与用户太多」），签到**确实没生效**，必须重试而非记成功或失败。判定 = code 白名单（`CONGESTION_CODES`，9074 起步）∪ 文案兜底。
+HTTP 2xx 但上游因限流/繁忙拒绝签到的响应，签到**确实没生效**，必须重试而非记成功或失败。判定 = code 白名单（`CONGESTION_CODES`）∪ 文案兜底。
+**9074 已不在此列**（2026-11-03 定性为设备校验失败，见下条）。
 _Avoid_: 限流失败、busy 错误
+
+**设备被拒（device rejected，code 9074）**:
+`X-Device-Id` 未通过上游设备校验。文案「当前参与用户太多」是幌子，与人数无关；
+同号重试必然再拒，正确处置是换号后重试一次。判据是 code（`DEVICE_REJECTED_CODE`），
+**先于**拥塞文案判定（「稍后」会被文案兜底误命中）。
+_Avoid_: 拥塞、限流（都会导致错误的处置路径）
+
+**积分余额（credits remaining）**:
+TRAE 客户端显示的可用积分 = `usage_summary.total_amount − usage_summary.consumed_amount`。
+2026-11-03 前累加 `credits_limit`（名义额度）得到的是「累计发放」，只涨不落，与客户端对不上。
+_Avoid_: 积分总和、额度合计（都是旧口径的说法）
 
 **设备绑定（device binding）**:
 账号与设备号在服务器侧的绑定关系（首个有效请求建立）。绑定设备可签；不匹配的设备被 9074 拒绝（文案「参与用户太多」是幌子）。2026-09-29 实测上游已收紧：**新生成的号无法建立首次绑定**。
 _Avoid_: 设备注册（未证实的机制表述）、设备锁
 
 **真号（real device ID）**:
-TRAE 客户端在本机 `storage.json` 键名 `iCubeAuthInfo://icube-dc:{号}` 上注册过的真实 Aha 设备号，新账号签到必须用它。从值里读不到、也不需要解密。
+TRAE 客户端在本机 `storage.json` 键名 `iCubeAuthInfo://icube-dc:{号}` 上注册过的真实 Aha 设备号。从值里读不到、也不需要解密；2026-11-03 起由程序自动分配，用户无需手动查找。
 _Avoid_: 客户端号（含混）、设备 ID（与生成号混用）
+
+**衍生真号（derived real ID）**:
+本机真号已被其它账号占用时，由 `login::derive_sibling_device_id` 生成的**同源不同号**设备号：
+前缀不变、末 4 位递增，位数与形态完全保持真号。用途是让多账号各有各的号而不退回生成号
+（一台设备一天只能签一个账号，撞号会得 9095）。
+_Avoid_: 假号、随机号
+
+**本机指纹号（machine device ID）**:
+没检测到客户端真号时，由 `COMPUTERNAME|USERNAME|APPDATA` 的 FNV-1a 哈希推出的稳定真号形态号。
+必须跨重启稳定，否则每次登录换号会反复打断上游设备绑定。
+_Avoid_: 兜底号（含混）
+
+**设备号自动分配（device ID auto-assignment）**:
+登录、导入凭证、签到前迁移三条路径共用的分配规则（`login::assign_device_id`）：
+已有合法号沿用 → 本机真号 → 衍生真号 → 本机指纹号。9074 时另有 `rotate_device_id` 换号，
+**同一账号一天最多换一次**（限频，防凭证被刷成随机数）；手动 `set_device_id` 会清零
+`deviceRotatedAt`，让用户改完号后仍能再拿到一次自动兜底。撞号判定只有一份实现
+`login::device_id_owner`（空号不算占用）。
+_Avoid_: 自动填号（含糊）
+
+**撞号（device ID collision）**:
+两个账号持有同一个设备号。上游限制**一个设备号一天只能签一个账号**，后签者会得
+终局失败 9095。程序分配时避让；手动设置撞号不阻塞但当场提示并写 `app.log` warn。
+_Avoid_: 重复号（含糊）
 
 **生成号（generated device ID）**:
 应用为登录账号随机生成的 16 位纯数字设备号。对 2026-09-17 前已绑定的账号有效；新账号用它必 9074。

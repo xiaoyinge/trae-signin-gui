@@ -76,9 +76,7 @@ export default function AccountPage() {
       const a = accounts.find((x) => x.uid === uid);
       toast.success(`${a?.nickname ?? uid}：${summarize(s)}`);
       if (s.retryable_failed > 0) {
-        toast.info(
-          "若为新账号且详情报 9074：上游已收紧设备校验，点账号卡 🔑「设置设备号」→「自动检测本机客户端」填入真号（一次性，见排障手册 3.9）",
-        );
+        toast.info("上游限流/网络瞬时失败，稍后会自动重试（周期检查会兜底）");
       }
     } catch (e) {
       toast.error(String(e));
@@ -120,6 +118,11 @@ export default function AccountPage() {
 
   const doSetDeviceId = async () => {
     if (!deviceIdUid) return;
+    // 撞号提醒（不阻塞）：一个设备号一天只能签一个账号，撞号的那个会得 9095
+    const clash = accounts.find((a) => a.uid !== deviceIdUid && a.device_id === deviceIdInput.trim());
+    if (clash) {
+      toast.warning(`该设备号已被「${clash.nickname || clash.uid}」使用：一个设备号一天只能签一个账号`);
+    }
     try {
       await api.setDeviceId(deviceIdUid, deviceIdInput);
       toast.success("设备号已更新");
@@ -210,7 +213,8 @@ export default function AccountPage() {
               onDelete={() => setDeleteUid(a.uid)}
               onSetDeviceId={() => {
                 setDeviceIdUid(a.uid);
-                setDeviceIdInput("");
+                // 预填当前号：用户点开就知道现在用的是哪个，改号时只需改差异部分
+                setDeviceIdInput(a.device_id ?? "");
               }}
             />
           ))}
@@ -260,11 +264,11 @@ export default function AccountPage() {
           填入真实设备号。
         </p>
         <p className="mb-2 text-xs text-[var(--text-dim)]">
-          适用场景：新账号签到报 9074「参与用户太多」（上游已收紧设备校验，应用生成的号过不了首次绑定）。
-          在<b>装过 TRAE 客户端并登录过该账号</b>的机器上，打开{" "}
-          <code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code>，找到{" "}
-          <code>iCubeAuthInfo://icube-dc:</code> 开头的键名，冒号后的 16 位数字即设备号。
-          注意一个号一天只能签一个账号。
+          设备号在<b>添加账号 / 导入凭证时已自动分配</b>（本机客户端真机码优先，多账号自动分开），
+          通常不需要手动改。这里仅用于覆盖：填错了号、或想换到另一台机器上提取的号。
+          号写在客户端 <code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code> 的
+          {" "}<code>iCubeAuthInfo://icube-dc:</code> 键名冒号后（点下方按钮可自动读取）。
+          注意：一个设备号一天只能签一个账号。
         </p>
         <Input
           className="w-full font-mono"
@@ -348,6 +352,18 @@ function AccountCard({
           </div>
           <div className="mt-1 text-xs text-[var(--text-dim)]">
             <span title={account.uid}>UID {account.uid.length > 14 ? account.uid.slice(0, 14) + "…" : account.uid}</span>
+            <span className="mx-2">·</span>
+            <span title={`设备号 ${account.device_id}（一个设备号一天只能签一个账号）`}>
+              设备 {account.device_id || "未分配"}
+            </span>
+            {account.device_rotated_at > 0 && Date.now() / 1000 - account.device_rotated_at < 86400 && (
+              <span
+                className="ml-1 text-[var(--warn,#d97706)]"
+                title="上游以 9074（文案「参与用户太多」）拒绝了旧设备号，程序已自动换号重试"
+              >
+                （今日已自动换号）
+              </span>
+            )}
             <span className="mx-2">·</span>
             token 至 {formatExpiry(account.expires_at)}
           </div>

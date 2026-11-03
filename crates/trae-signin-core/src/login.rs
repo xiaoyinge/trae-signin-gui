@@ -105,7 +105,8 @@ pub fn detect_client_device_ids() -> Vec<String> {
     let Ok(appdata) = std::env::var("APPDATA") else {
         return Vec::new();
     };
-    for dir in ["Trae CN", "Trae"] {
+    // 客户端目录名实测有这三种（2026-11-03 本机核对：`Trae CN` 与 `TRAE SOLO CN` 并存）
+    for dir in ["Trae CN", "TRAE SOLO CN", "Trae", "Trae Solo"] {
         let path = std::path::Path::new(&appdata)
             .join(dir)
             .join("User")
@@ -119,6 +120,200 @@ pub fn detect_client_device_ids() -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+// ─────────────────── 设备号自动分配（2026-11-03） ───────────────────
+
+/// 设备号来源（写日志用，排障时一眼看出这个号是哪来的）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceIdSource {
+    /// 该账号原本就有合法设备号，沿用（保持上游绑定，绝不轮换）
+    Existing,
+    /// 本机 TRAE 客户端注册过的真机码，且未被其它账号占用
+    ClientReal,
+    /// 本机真机码已被其它账号占用 → 同源衍生的另一位真机码（前缀不变、低位递增）
+    ClientDerived,
+    /// 本机没装/没登录客户端 → 由本机指纹稳定推导的真机码形态号
+    MachineDerived,
+}
+
+impl DeviceIdSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceIdSource::Existing => "沿用原设备号",
+            DeviceIdSource::ClientReal => "本机客户端真机码",
+            DeviceIdSource::ClientDerived => "真机码同源衍生（本机真机码已被其它账号占用）",
+            DeviceIdSource::MachineDerived => "本机指纹推导（未检测到客户端真机码）",
+        }
+    }
+}
+
+/// 设备号分配结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdPick {
+    pub device_id: String,
+    pub source: DeviceIdSource,
+}
+
+/// 从真机码派生一个**同源不同号**的设备号。
+///
+/// 为什么需要：一台设备一天只能签一个账号（同号第二个账号 claim 回 code=9095），
+/// 而本机客户端只会注册一个真机码。多账号就必须各有各的号，但这个号仍要是
+/// 「真机码形态」，不能退回随机生成号——随机号过不了上游的新账号设备绑定（9074）。
+///
+/// 做法：**前缀不动、末 4 位递增**，位数与段位完全保持真机码形态；
+/// 跳过 `used` 里已占用、跳过与 `base` 相同、跳过退化成非法的候选。
+pub fn derive_sibling_device_id(base: &str, used: &[String]) -> Option<String> {
+    if !is_valid_device_id(base) {
+        return None;
+    }
+    let (head, tail) = base.split_at(base.len() - 4);
+    let tail_n: u32 = tail.parse().ok()?;
+    for step in 1..=9999u32 {
+        let n = (tail_n + step) % 10_000;
+        let cand = format!("{head}{n:04}");
+        if cand == base {
+            continue;
+        }
+        if !is_valid_device_id(&cand) {
+            continue;
+        }
+        if used.iter().any(|u| u == &cand) {
+            continue;
+        }
+        return Some(cand);
+    }
+    None
+}
+
+/// 本机指纹 → 稳定的真机码形态号（未检测到客户端真机码时使用）。
+///
+/// 「稳定」很关键：同一台机器每次启动都必须推出**同一个**号，否则每次登录都换号，
+/// 上游的设备绑定会被反复打断。这里用 FNV-1a 对 机器名+用户名+APPDATA 求值，
+/// 落在 1e15~9e15（16 位、Aha 号形态），再按 `used` 同源衍生避让。
+pub fn machine_device_id(used: &[String]) -> String {
+    let mut seed = String::new();
+    for k in ["COMPUTERNAME", "USERNAME", "APPDATA"] {
+        seed.push_str(&std::env::var(k).unwrap_or_default());
+        seed.push('|');
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in seed.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let base = (hash % 8_000_000_000_000_000 + 1_000_000_000_000_000).to_string();
+    if !used.iter().any(|u| u == &base) {
+        return base;
+    }
+    derive_sibling_device_id(&base, used).unwrap_or_else(gen_device_id)
+}
+
+/// 该设备号当前被哪个账号占用（`None` = 没被任何账号占用）。
+///
+/// 用途：一台设备一天只能签一个账号，撞号会让 claim 直接回 `code=9095`（终局失败、
+/// 重试无用）。手动设置设备号、分配前检查都必须走这一处判定，避免两份实现漂移。
+pub fn device_id_owner(uid: &str, device_id: &str, creds: &[crate::auth::Credential]) -> Option<String> {
+    // 空号 = 还没分配，不是「占用」：未分配账号之间不应互相判成撞号
+    if device_id.is_empty() {
+        return None;
+    }
+    creds
+        .iter()
+        .find(|c| c.uid != uid && c.device_id == device_id)
+        .map(|c| c.uid.clone())
+}
+
+/// 为某个账号挑设备号（登录、导入、迁移三条路径共用）。
+///
+/// 语义（2026-11-03 拍板）：
+/// 1. 该账号**已有合法设备号 → 原样沿用**，绝不轮换（轮换等于把已验证的绑定弄坏）；
+/// 2. 新账号 → 自动分配一个真机码，**不与其它账号重复**（一台设备一天只能签一个账号）；
+/// 3. 真机码优先：本机客户端注册过的号 → 被占则同源衍生 → 无客户端则本机指纹推导。
+///
+/// 调用方不需要让用户去翻 `storage.json`：本函数替他把号填好。
+pub fn assign_device_id(
+    uid: &str,
+    existing: &[crate::auth::Credential],
+    client_ids: &[String],
+) -> DeviceIdPick {
+    pick_device_id(uid, existing, client_ids, None)
+}
+
+/// 9074 后的换号：与 [`assign_device_id`] 同源，但**必须换掉** `current`
+/// ——同号重试必再被拒，且不能把刚被拒的号再选回来。
+pub fn rotate_device_id(
+    uid: &str,
+    existing: &[crate::auth::Credential],
+    client_ids: &[String],
+    current: &str,
+) -> DeviceIdPick {
+    pick_device_id(uid, existing, client_ids, Some(current))
+}
+
+fn pick_device_id(
+    uid: &str,
+    existing: &[crate::auth::Credential],
+    client_ids: &[String],
+    avoid: Option<&str>,
+) -> DeviceIdPick {
+    // 1) 已有账号：沿用（含「重新登录同一账号」）。换号模式（avoid=Some）跳过本步。
+    if avoid.is_none() {
+        if let Some(c) = existing.iter().find(|c| c.uid == uid) {
+            if is_valid_device_id(&c.device_id) {
+                return DeviceIdPick {
+                    device_id: c.device_id.clone(),
+                    source: DeviceIdSource::Existing,
+                };
+            }
+        }
+    }
+    // 2) 其它账号已占用的号（本账号自己的号不算占用：换号时它正是要被换掉的那个）
+    let mut used: Vec<String> = existing
+        .iter()
+        .filter(|c| c.uid != uid)
+        .map(|c| c.device_id.clone())
+        .filter(|d| is_valid_device_id(d))
+        .collect();
+    if let Some(cur) = avoid {
+        if is_valid_device_id(cur) && !used.iter().any(|u| u == cur) {
+            used.push(cur.to_string());
+        }
+    }
+
+    // 3) 本机客户端真机码：唯一/多个都按顺序取第一个未被占用的
+    for id in client_ids.iter().filter(|d| is_valid_device_id(d)) {
+        if !used.iter().any(|u| u == id) {
+            return DeviceIdPick {
+                device_id: id.clone(),
+                source: DeviceIdSource::ClientReal,
+            };
+        }
+    }
+    // 4) 真机码已被占：同源衍生（保持真机码形态，但与原有账号分开）
+    if let Some(base) = client_ids.iter().find(|d| is_valid_device_id(d)) {
+        if let Some(sib) = derive_sibling_device_id(base, &used) {
+            return DeviceIdPick {
+                device_id: sib,
+                source: DeviceIdSource::ClientDerived,
+            };
+        }
+    }
+    // 5) 没检测到客户端：本机指纹推导（仍是真机码形态且跨重启稳定）
+    let machine = machine_device_id(&used);
+    if avoid.is_some_and(|cur| cur == machine) {
+        // 换号模式：指纹号恰好就是被拒的那个 → 同源推一个相邻号
+        if let Some(sib) = derive_sibling_device_id(&machine, &used) {
+            return DeviceIdPick {
+                device_id: sib,
+                source: DeviceIdSource::MachineDerived,
+            };
+        }
+    }
+    DeviceIdPick {
+        device_id: machine,
+        source: DeviceIdSource::MachineDerived,
+    }
 }
 
 /// 生成 32 位 hex trace id，同时充当回调 state：
@@ -391,8 +586,115 @@ mod tests {
         assert!(extract_device_ids_from_storage_json("{}").is_empty());
     }
 
+    // ── 设备号自动分配（2026-11-03） ──
+
+    fn cred(uid: &str, device: &str) -> crate::auth::Credential {
+        crate::auth::Credential {
+            uid: uid.into(),
+            device_id: device.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 多账号：第一个账号直接拿走本机真机码，第二个账号**自动**拿到另一位
+    /// 同源真机码——不需要用户自己去 storage.json 里翻第二个号。
+    /// 这正是「多账号时直接填一个真机码、且与原有账号分开」的行为契约。
+    #[test]
+    fn assign_device_id_second_account_gets_derived_real_id() {
+        // 假号（形态与真机码一致，16 位纯数字）：不得用真实设备号，避免本机标识入库
+        let real = "3812345678901234";
+        let client = vec![real.to_string()];
+
+        // 第一个账号：无既有凭证 → 直接采用真机码
+        let first = assign_device_id("u-1", &[], &client);
+        assert_eq!(first.device_id, real);
+        assert_eq!(first.source, DeviceIdSource::ClientReal);
+
+        // 第二个账号：真机码已被 u-1 占用 → 自动衍生，且与真机码不同
+        let existing = vec![cred("u-1", real)];
+        let second = assign_device_id("u-2", &existing, &client);
+        assert_eq!(second.source, DeviceIdSource::ClientDerived);
+        assert_ne!(second.device_id, real, "不得与已占用账号撞号");
+        assert!(is_valid_device_id(&second.device_id), "衍生号仍须是真机码形态");
+        assert_eq!(&second.device_id[..12], &real[..12]);
+
+        // 第三个账号：两个号都占了 → 再衍生一个不同的
+        let existing2 = vec![cred("u-1", real), cred("u-2", &second.device_id)];
+        let third = assign_device_id("u-3", &existing2, &client);
+        assert_ne!(third.device_id, real);
+        assert_ne!(third.device_id, second.device_id);
+        assert!(is_valid_device_id(&third.device_id));
+    }
+
+    /// `device_id_owner` 是撞号判定的唯一实现（手动设置/导入/分配共用）。
+    /// 一台设备一天只能签一个账号，撞号的另一个会得 9095——归属判定不能有两份。
+    #[test]
+    fn device_id_owner_ignores_self_and_finds_other() {
+        let real = "3812345678901234";
+        let creds = vec![cred("u-1", real), cred("u-2", "3812345678909876")];
+
+        // 自己占着自己的号 → 不算撞号
+        assert_eq!(device_id_owner("u-1", real, &creds), None);
+        // 别人的号 → 返回占用者 uid
+        assert_eq!(device_id_owner("u-2", real, &creds), Some("u-1".into()));
+        // 谁都没占 → None
+        assert_eq!(device_id_owner("u-1", "1111111111111111", &creds), None);
+        // 空号不算占用（未分配账号之间不互相冲突）
+        let with_empty = vec![cred("u-3", ""), cred("u-4", "")];
+        assert_eq!(device_id_owner("u-4", "", &with_empty), None);
+    }
+
+    /// 已有账号（含同一账号重新登录）必须**原样沿用**原设备号：
+    /// 轮换等于把已验证的上游绑定弄坏。
+    #[test]
+    fn assign_device_id_keeps_existing_account_device() {
+        let existing = vec![cred("u-1", "1234567890123456")];
+        let pick = assign_device_id("u-1", &existing, &["3812345678901234".to_string()]);
+        assert_eq!(pick.device_id, "1234567890123456");
+        assert_eq!(pick.source, DeviceIdSource::Existing);
+    }
+
+    /// 没装客户端：本机指纹推导，且**跨调用稳定**（每次登录都换号会把绑定反复打断）。
+    #[test]
+    fn machine_device_id_is_stable_and_valid() {
+        let a = machine_device_id(&[]);
+        let b = machine_device_id(&[]);
+        assert_eq!(a, b, "同一台机器必须推出同一个号");
+        assert!(is_valid_device_id(&a), "须为真机码形态，实际 {a}");
+        assert_eq!(a.len(), 16);
+        let c = machine_device_id(std::slice::from_ref(&a));
+        assert_ne!(c, a);
+        assert!(is_valid_device_id(&c));
+    }
+
+    /// 9074 换号：必须换掉当前号（同号重试必再拒），且不与其它账号撞号。
+    #[test]
+    fn rotate_device_id_never_returns_rejected_id() {
+        let real = "3812345678901234";
+        let existing = vec![cred("u-1", real)];
+        let pick = rotate_device_id("u-1", &existing, &[real.to_string()], real);
+        assert_ne!(pick.device_id, real);
+        assert!(is_valid_device_id(&pick.device_id));
+
+        let base = machine_device_id(&[]);
+        let rot = rotate_device_id("u-9", &[cred("u-9", &base)], &[], &base);
+        assert_ne!(rot.device_id, base);
+        assert!(is_valid_device_id(&rot.device_id));
+    }
+
+    #[test]
+    fn derive_sibling_skips_used_and_keeps_shape() {
+        let base = "3812345678901234";
+        let used = vec!["3812345678901235".to_string()];
+        let s = derive_sibling_device_id(base, &used).unwrap();
+        assert_eq!(s, "3812345678901236", "跳过已占用候选");
+        assert!(is_valid_device_id(&s));
+        assert!(derive_sibling_device_id("abc", &[]).is_none());
+    }
+
     #[test]
     fn gen_ids_format() {
+
         assert_eq!(gen_machine_id().len(), 32);
         assert!(gen_machine_id().chars().all(|c| c.is_ascii_hexdigit()));
         // state 绑定要求 128 位熵：32 位 hex（PLAN §10 #7）

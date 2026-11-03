@@ -129,6 +129,15 @@ pub fn i64_field(v: &Value, name: &str) -> Option<i64> {
     None
 }
 
+/// 取数值字段：接受 JSON number（整数/小数）与纯数字字符串（上游偶有字符串形态）。
+fn num_field(v: &Value, name: &str) -> Option<f64> {
+    let x = find_pref(v, name)?;
+    if let Some(n) = x.as_f64() {
+        return Some(n);
+    }
+    x.as_str().and_then(|s| s.trim().parse::<f64>().ok())
+}
+
 fn bool_field(v: &Value, name: &str) -> Option<bool> {
     find_pref(v, name).and_then(|x| x.as_bool())
 }
@@ -147,13 +156,21 @@ fn is_congestion(msg: &str) -> bool {
     CONGESTION_HINTS.iter().any(|h| lower.contains(h))
 }
 
+/// 上游「设备号不被认可」的业务码（2026-11-03 定名，9074 从拥塞白名单移出）。
+///
+/// `app.log` 实测形态：HTTP 200 + `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`。
+/// 文案是幌子：真因是 `X-Device-Id` 没通过服务端设备校验（生成号过不了新账号首次绑定，
+/// 或该设备号已被别的账号占用），**与「人多」无关**。同号重试必然再拒，
+/// 所以它不进 `CONGESTION_CODES`、不参与同轮退避重试；正确处置是换号（见
+/// `signin_account` 的自动换号）后重试一次。
+const DEVICE_REJECTED_CODE: i64 = 9074;
+
 /// 实测拥塞 code 白名单（PLAN §10 #5，主判据）。
 ///
-/// `9074` 来自 2026-09-16 08:47 `app.log` 实测：HTTP 200 +
-/// `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`（仅此两字段）。
-/// 文案匹配退为兜底，两者并集：任一命中即 Retryable。
+/// **9074 已移出**（2026-11-03）：它是设备校验失败，不是拥塞（见 `DEVICE_REJECTED_CODE`）。
+/// 保留下来的 code 都是「服务端在限流/繁忙」，同号重试有意义。
 /// 每核实一个新 code 就补进来并同步 PLAN §2；不得把匹配范围扩到原始响应体。
-const CONGESTION_CODES: &[i64] = &[9074];
+const CONGESTION_CODES: &[i64] = &[];
 
 /// 设备维度「今日已签」code（PLAN §2/§9，2026-09-29 登记并拍板修复）。
 ///
@@ -206,6 +223,9 @@ pub struct SigninResult {
     pub refresh_failed: bool,
     /// 状态查询或 claim 因瞬时错误未拿到结果 → 这一轮对该账号无进展，可稍后再来
     pub retryable: bool,
+    /// 本轮替该账号更换了设备号（9074 设备校验失败后自动换号 / 非法形态迁移）。
+    /// 调用方据此在进度与历史里点明原因，别让用户以为「人多」或「网络差」。
+    pub device_rotated: bool,
 }
 
 impl Default for Upstream {
@@ -440,11 +460,14 @@ impl Upstream {
 
     /// 执行签到（claim）
     ///
-    /// 判定规则（三条路径实测/比对得来）：
-    /// - `code=9095`（设备维度今日已签，`DEVICE_ALREADY_SIGNED_CODE`）→ 终局 `Failed`，200/4xx 两路径都拦截、不重试，**先于**以下判定（2026-09-29 修复，PLAN §9）
-    /// - `HTTP >= 400` → 失败；文案含"已签到/already check"归 ALREADY；401/403 → AuthExpired，408/429/5xx → Retryable
-    /// - `HTTP 2xx` + 拥塞响应（**code 白名单**（`CONGESTION_CODES`，9074 起步）或拥塞文案，任一命中）→ **Retryable**：签到确实没生效，交给 `with_ug_retry` 退避重试
-    /// - `HTTP 2xx` + 其余情况 → 成功（对齐 Go `doJSON`：它从不解析响应体，只看状态码）
+    /// 判定规则（实测得来，顺序即优先级）：
+    /// - `code=9095`（设备维度今日已签）→ 终局 `Failed`，200/4xx 两路径都拦、不重试（PLAN §9）
+    /// - `code=9074`（`DEVICE_REJECTED_CODE`）→ `CoreError::DeviceRejected`：**设备号不被认可**，
+    ///   文案「当前参与用户太多」是幌子。不进退避重试（同号必再拒），由 `signin_account`
+    ///   换号后重试一次（2026-11-03 定名，此前被误判为拥塞）
+    /// - `HTTP >= 400` → 失败；文案含「已签到/already check」归 ALREADY；401/403 → AuthExpired，408/429/5xx → Retryable
+    /// - `HTTP 2xx` + 拥塞响应（`CONGESTION_CODES` 或拥塞文案，任一命中）→ `Retryable`，交给 `with_ug_retry`
+    /// - `HTTP 2xx` + 其余 → 成功（对齐 Go `doJSON`：它从不解析响应体，只看状态码）
     ///
     /// `code` 只按「顶层 → `data` → 全树」优先序取，避免嵌套同名字段误判。完整响应体落 info 日志（`{数据目录}/app.log`），
     /// 用于核实上游 `code` 语义——文案匹配只是兜底，不是判据的最终形态。
@@ -478,6 +501,16 @@ impl Upstream {
                 message: format!("设备今日已签到（code=9095，设备维度一天一次，重试无用）: {m}"),
             });
         }
+        // 9074 = 设备号不被认可（DEVICE_REJECTED_CODE），**必须最先拦**：
+        // ① 它的文案带「稍后」，落到拥塞文案兜底会被当限流白等 20 秒；
+        // ② 若上游改以 4xx 送达，落到 classify_ug 只会得到含糊的 Other 失败。
+        // 两条送达路径都在此收口（与 9095 同款防御，实测未见过 4xx 送达）。
+        if code == DEVICE_REJECTED_CODE {
+            let m = message.as_deref().unwrap_or("当前设备号未被上游认可");
+            return Err(CoreError::DeviceRejected(format!(
+                "code=9074 设备号未被上游认可（文案「参与用户太多」是幌子）: {m}"
+            )));
+        }
         if status.as_u16() >= 400 {
             // 错误信息含"已签到/already check"归为 ALREADY
             let lower = text.to_lowercase();
@@ -491,7 +524,7 @@ impl Upstream {
         }
         log::info!("claim HTTP {status} 响应体: {text}");
         // 拥塞判定（PLAN §10 #5）：code 白名单为主、文案匹配为兜底（并集）。
-        // 真正生效的一次签到既不会回实测拥塞码 9074，也不会回「用户太多，请稍后再试」。
+        // 9074 已在上面收口，不会走到这里。
         let congested =
             CONGESTION_CODES.contains(&code) || message.as_deref().is_some_and(is_congestion);
         if congested {
@@ -507,10 +540,21 @@ impl Upstream {
         })
     }
 
-    /// 查询积分余额 = sum(user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit)
+    /// 查询积分余额 = `usage_summary.total_amount - usage_summary.consumed_amount`
     ///
-    /// 返回 f64 保留上游原始精度（2026-09-23 拍板）：旧实现 `f64 as i64` 会把
-    /// 小数积分（如 5900.5）静默截断成整数。整数积分序列化后显示不变（7100 → 7100）。
+    /// 口径变更（2026-11-03）：旧实现累加
+    /// `user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit`——那是
+    /// **名义额度**：签到每天新增一个 100 分包只增不减，对话消耗记在服务端账本上、
+    /// 不写回 `credits_limit`，于是本工具显示的积分只涨不落，与 TRAE 客户端显示的余额
+    /// 越用差得越远。`usage_summary` 才是服务端账本：`total_amount` 为已发放总额、
+    /// `consumed_amount` 为已消耗，两者之差即真实可用余额（客户端显示的就是它）。
+    ///
+    /// 缺 `usage_summary` 或其中关键字段 → 返回 `Err`：调用方 `.ok()` 会把它显示成
+    /// 「积分未知」，**绝不**退回名义额度累加——那正是两边数字对不上的根因，静默兜底
+    /// 等于把已修的 bug 藏回去。
+    ///
+    /// 返回 f64 保留上游原始精度（2026-09-23 拍板）：整数积分序列化后显示不变（7100 → 7100），
+    /// 小数积分（如 5900.5）不再被 `as i64` 静默截断。
     pub async fn query_credits(&self, cred: &Credential) -> Result<f64, CoreError> {
         let url = format!("{}{EP_ENT_USAGE}", self.ug_base);
         let resp = self
@@ -527,19 +571,31 @@ impl Upstream {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CoreError::Other(format!("ent usage 解析失败: {e}")))?;
-        let mut total = 0f64;
-        let packs = find_key(&v, "userEntitlementPackList");
-        if let Some(Value::Array(list)) = packs {
-            for pack in list {
-                if let Some(limit) = find_key(pack, "creditsLimit").and_then(|x| {
-                    x.as_f64()
-                        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-                }) {
-                    total += limit;
-                }
-            }
+        // usage_summary 优先序：顶层 → data 包装 → 全树（与其它判据字段同款，见 find_pref）
+        let summary = find_pref(&v, "usageSummary")
+            .filter(|x| x.is_object())
+            .ok_or_else(|| {
+                CoreError::Other(format!("ent usage 缺少 usage_summary，无法确定积分余额: {text}"))
+            })?;
+        let total = num_field(summary, "totalAmount").ok_or_else(|| {
+            CoreError::Other(format!(
+                "ent usage 缺少 usage_summary.total_amount，无法确定积分余额: {text}"
+            ))
+        })?;
+        let consumed = num_field(summary, "consumedAmount").ok_or_else(|| {
+            CoreError::Other(format!(
+                "ent usage 缺少 usage_summary.consumed_amount，无法确定积分余额: {text}"
+            ))
+        })?;
+        let remaining = total - consumed;
+        // 负余额说明口径或字段归属出了问题（理论上 consumed 不会超过 total）。
+        // 不截断成 0——那会把不一致藏起来；如实显示并留痕，让人去 app.log 对原始响应体。
+        if remaining < 0.0 {
+            log::warn!(
+                "积分余额为负（total={total} consumed={consumed}），口径或字段归属可能有变，原始响应体: {text}"
+            );
         }
-        Ok(total)
+        Ok(remaining)
     }
 
     // ── 组合流程 ──
@@ -574,39 +630,90 @@ impl Upstream {
         Ok(())
     }
 
-    /// 迁移历史遗留的非官方形态 deviceId（32 位 hex UUID / 其他超界形态 → 16 位数字 Aha 号）。
+    /// 保证账号带着可用设备号：非法形态（32 位 hex / 空 / 超界）或缺失时**自动分配**。
     ///
-    /// claim 的活动校验会检查 `X-Device-Id` 形态，UUID 形态被 9074 拒绝。
-    /// 合法形态见 `login::is_valid_device_id`（纯数字 12~20 位，2026-09-29 放宽：
-    /// 15 位真号实测存在，不得误杀）。迁移只影响 UG 请求头；写盘失败不阻塞签到
-    /// （内存中的新 id 本轮仍生效，下一轮会再尝试回写）。
-    async fn ensure_device_id_format(
-        cred: &mut Credential,
-        data_dir: &std::path::Path,
-    ) -> bool {
+    /// 分配规则见 `login::assign_device_id`（2026-11-03）：已有合法号原样沿用；新账号
+    /// 自动取本机客户端真机码，被占则同源衍生，未装客户端则本机指纹推导——**不需要用户
+    /// 自己去翻 `storage.json`**，也不会与已有账号撞同一个号（一台设备一天只能签一个账号）。
+    ///
+    /// 写盘失败不阻塞签到（内存值本轮生效，下一轮再回写）。
+    async fn ensure_device_id(cred: &mut Credential, data_dir: &std::path::Path) -> bool {
         if crate::login::is_valid_device_id(&cred.device_id) {
             return false;
         }
-        cred.device_id = crate::login::gen_device_id();
-        match crate::auth::save_credential(data_dir, cred) {
-            Ok(_) => {
-                log::info!("账号 {} 的 deviceId 非官方数字形态（会触发 9074），已迁移为 16 位数字 Aha 设备号", cred.uid);
-                true
-            }
-            Err(e) => {
-                log::warn!("账号 {} deviceId 迁移写盘失败（本轮先用内存值）: {e}", cred.uid);
-                true
-            }
+        let existing = crate::auth::list_credentials(data_dir).unwrap_or_default();
+        let pick = crate::login::assign_device_id(
+            &cred.uid,
+            &existing,
+            &crate::login::detect_client_device_ids(),
+        );
+        cred.device_id = pick.device_id.clone();
+        log::info!(
+            "账号 {} 的设备号非法/缺失（会触发 9074），已自动分配 {}（{}）",
+            cred.uid,
+            pick.device_id,
+            pick.source.as_str()
+        );
+        if let Err(e) = crate::auth::save_credential(data_dir, cred) {
+            log::warn!("账号 {} 设备号分配后写盘失败（本轮先用内存值）: {e}", cred.uid);
         }
+        true
     }
 
-    /// 单账号签到全流程：刷新 token → status 判定 → claim
+    /// 9074 后换号：挑一个**与当前号不同**的设备号并回写。
+    ///
+    /// 换号只改本地凭证与请求头；上游绑定在下次成功 claim 时按新号建立。
+    async fn rotate_device_id(
+        cred: &mut Credential,
+        data_dir: &std::path::Path,
+    ) -> Option<crate::login::DeviceIdSource> {
+        // 限频：同一账号一天最多自动换一次号。否则真被上游拒的账号每轮都换，
+        // 一天 24 轮下来凭证里的号全是随机的，真实原因反而被掩盖。
+        let now = chrono::Utc::now().timestamp();
+        if cred.device_rotated_at > 0 && now - cred.device_rotated_at < 86_400 {
+            log::warn!(
+                "账号 {}：今日（{} 前）已自动换过一次设备号，不再换号；9074 的真实原因需要人工确认",
+                cred.uid,
+                now - cred.device_rotated_at
+            );
+            return None;
+        }
+        let existing = crate::auth::list_credentials(data_dir).unwrap_or_default();
+        let pick = crate::login::rotate_device_id(
+            &cred.uid,
+            &existing,
+            &crate::login::detect_client_device_ids(),
+            &cred.device_id,
+        );
+        if pick.device_id == cred.device_id {
+            log::warn!("账号 {}：设备号换号失败（无可用候选），保持 {}", cred.uid, cred.device_id);
+            return None;
+        }
+        log::warn!(
+            "账号 {}：9074 设备号未被认可，已换号 {} → {}（{}）",
+            cred.uid,
+            cred.device_id,
+            pick.device_id,
+            pick.source.as_str()
+        );
+        cred.device_id = pick.device_id;
+        cred.device_rotated_at = now;
+        if let Err(e) = crate::auth::save_credential(data_dir, cred) {
+            log::warn!("账号 {} 换号后写盘失败（本轮先用内存值）: {e}", cred.uid);
+        }
+        Some(pick.source)
+    }
+
+    /// 单账号签到全流程：刷新 token → status 判定 → claim（9074 自动换号重试一次）
     pub async fn signin_account(
         &self,
         cred: &mut Credential,
         data_dir: &std::path::Path,
     ) -> SigninResult {
-        Self::ensure_device_id_format(cred, data_dir).await;
+        // 非法形态迁移只改本地号，不算「9074 换号」——两者对用户的含义完全不同
+        // （前者无需解释，后者要说清上游为什么拒），故不置 device_rotated。
+        let _ = Self::ensure_device_id(cred, data_dir).await;
+        let mut device_rotated = false;
 
         let mut outcome = CheckinOutcome {
             status: CheckinStatus::Unknown,
@@ -622,13 +729,13 @@ impl Upstream {
                 need_relogin = true;
                 outcome.status = CheckinStatus::Failed;
                 outcome.message = format!("刷新 token 失败（需重新登录）: {m}");
-                return SigninResult { outcome, credits, need_relogin, refresh_failed, retryable };
+                return SigninResult { outcome, credits, need_relogin, refresh_failed, retryable, device_rotated };
             }
             Err(e) => {
                 refresh_failed = true;
                 outcome.status = CheckinStatus::Failed;
                 outcome.message = format!("刷新 token 失败: {e}");
-                return SigninResult { outcome, credits, need_relogin, refresh_failed, retryable };
+                return SigninResult { outcome, credits, need_relogin, refresh_failed, retryable, device_rotated };
             }
             Ok(()) => {}
         }
@@ -647,8 +754,13 @@ impl Upstream {
                     outcome.status = CheckinStatus::Disabled;
                     outcome.message = "签到功能未启用".into();
                 } else {
-                    match self.checkin_claim(cred).await {
-                        Ok(o) => outcome = o,
+                    match self.claim_with_device_rotation(cred, data_dir).await {
+                        Ok((o, rotated)) => {
+                            outcome = o;
+                            if rotated {
+                                device_rotated = true;
+                            }
+                        }
                         Err(e) => {
                             retryable = matches!(e, CoreError::Retryable(_) | CoreError::Http(_));
                             outcome.status = CheckinStatus::Failed;
@@ -659,8 +771,44 @@ impl Upstream {
             }
         }
 
-        credits = self.query_credits(cred).await.ok();
-        SigninResult { outcome, credits, need_relogin, refresh_failed, retryable }
+        // 积分查询失败不再静默：新口径下 Err 意味着 **usage_summary 缺失/字段改名**，
+        // 这是上游账本结构变了的信号，必须留痕（界面显示「积分未知」是结果，日志里要有原因）。
+        credits = match self.query_credits(cred).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!("账号 {} 积分查询失败（界面显示为未知）: {e}", cred.uid);
+                None
+            }
+        };
+        SigninResult { outcome, credits, need_relogin, refresh_failed, retryable, device_rotated }
+    }
+
+    /// claim + 9074 换号重试（2026-11-03）。
+    ///
+    /// 9074 是**设备号不被认可**，与「人多」无关：原号重试必再拒，唯一有效动作是换号。
+    /// 所以这里换号后**只重试一次**——上游若对新号仍拒，说明该账号的设备绑定另有约束
+    /// （如绑定在别的号上），继续换号只会污染凭证文件，如实报错让用户看到原因。
+    /// 返回 `(outcome, 是否换过号)`。
+    async fn claim_with_device_rotation(
+        &self,
+        cred: &mut Credential,
+        data_dir: &std::path::Path,
+    ) -> Result<(CheckinOutcome, bool), CoreError> {
+        match self.checkin_claim(cred).await {
+            Err(CoreError::DeviceRejected(m)) => {
+                let Some(source) = Self::rotate_device_id(cred, data_dir).await else {
+                    return Err(CoreError::DeviceRejected(m));
+                };
+                log::info!(
+                    "账号 {}：换号来源 {}，用新设备号重试 claim 一次",
+                    cred.uid,
+                    source.as_str()
+                );
+                self.checkin_claim(cred).await.map(|o| (o, true))
+            }
+            Ok(o) => Ok((o, false)),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -919,8 +1067,8 @@ mod tests {
     }
 
     /// 回归锚点（2026-09-16 全天 9074 事故）：signin_account 会把 32 位 hex UUID
-    /// 形态的旧 deviceId 迁移为 16 位数字 Aha 设备号并回写凭证文件；已是合法
-    /// 格式的 deviceId 原样保留。
+    /// 形态的旧 deviceId 自动换成合法设备号并回写凭证文件；已是合法
+    /// 格式的 deviceId 原样保留（绝不轮换已验证的绑定）。
     #[tokio::test]
     async fn signin_migrates_legacy_hex_device_id() {
         let server = MockServer::start();
@@ -930,7 +1078,7 @@ mod tests {
         });
         server.mock(|when, then| {
             when.method(POST).path(EP_ENT_USAGE);
-            then.status(200).body(r#"{}"#);
+            then.status(200).body(r#"{"usage_summary":{"total_amount":0,"consumed_amount":0}}"#);
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
         let dir = std::env::temp_dir().join(format!("tsup-{}", uuid::Uuid::new_v4()));
@@ -1009,11 +1157,17 @@ mod tests {
         }
     }
 
-    /// code 白名单独立生效（PLAN §10 #5）：实测拥塞码 9074 即使命文案正常（或缺失）
-    /// 也必须 Retryable——上游若改写文案，白名单是最后一道防线。
+    /// 9074 定性（2026-11-03）：**设备号不被认可，不是拥塞**。
+    ///
+    /// 旧实现把它当拥塞去退避重试，白等 20 秒还把真因埋在「上游繁忙」里；文案里那个
+    /// 「稍后」正是文案兜底会误命中的地方。新判据必须：
+    /// 1. 返回 `DeviceRejected`（不进退避重试白名单）；
+    /// 2. `assert_hits(1)` —— 同号重试没有意义，不许在 claim 层重试；
+    /// 3. 即使文案完全正常（或缺失）也照样定性，不靠文案。
     #[tokio::test]
-    async fn claim_retries_congestion_code_whitelist() {
+    async fn claim_9074_is_device_rejected_not_congestion() {
         for body in [
+            r#"{"code":9074,"message":"当前参与用户太多，请稍后再试"}"#,
             r#"{"code":9074,"message":"ok"}"#,
             r#"{"code":9074}"#,
         ] {
@@ -1025,11 +1179,144 @@ mod tests {
             let up = Upstream::with_bases(&server.url(""), &server.url(""))
                 .with_retry_backoff(std::time::Duration::ZERO);
             match up.checkin_claim(&cred_with("at", "d")).await {
-                Err(CoreError::Retryable(msg)) => assert!(msg.contains("9074"), "{msg}"),
-                other => panic!("expect Retryable for {body}, got {other:?}"),
+                Err(CoreError::DeviceRejected(msg)) => {
+                    assert!(msg.contains("9074"), "{msg}");
+                    assert!(msg.contains("设备号"), "{msg}");
+                }
+                other => panic!("expect DeviceRejected for {body}, got {other:?}"),
             }
-            m.assert_hits(UG_ATTEMPTS);
+            m.assert_hits(1);
         }
+    }
+
+    /// 9074 换号重试（2026-11-03）：claim 被 9074 拒 → 自动换号 → 用新号再试一次并成功。
+    ///
+    /// 断言要点：
+    /// 1. 原设备号那次请求拿到 9074（`m9074.assert_hits(1)`）；
+    /// 2. 新设备号那次请求拿到成功——用自定义 matcher 匹配「不是原号」的 X-Device-Id，
+    ///    命中即证明第二次请求确实换了号；
+    /// 3. 新号已回写凭证文件（下一轮/重启后继续用它，不会每轮重试都换号）；
+    /// 4. `device_rotated = true`，调用方据此在进度里点明真实原因。
+    #[tokio::test]
+    async fn signin_rotates_device_id_after_9074() {
+        use httpmock::prelude::HttpMockRequest;
+
+        const OLD: &str = "1234567890123456";
+        // matcher 是函数指针，不能捕获环境：把「必须是另一个号」写成纯函数
+        fn not_old_device(req: &HttpMockRequest) -> bool {
+            req.headers
+                .as_ref()
+                .map(|hs| {
+                    hs.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("x-device-id") && v != "1234567890123456"
+                    })
+                })
+                .unwrap_or(false)
+        }
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path(EP_CHECKIN_STATUS);
+            then.status(200).body(r#"{"checked_in":false,"enable":true}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path(EP_ENT_USAGE);
+            then.status(200).body(r#"{"usage_summary":{"total_amount":500,"consumed_amount":0}}"#);
+        });
+        // 原号 → 9074
+        let m9074 = server.mock(|when, then| {
+            when.method(POST)
+                .path(EP_CHECKIN_CLAIM)
+                .header("X-Device-Id", OLD);
+            then.status(200)
+                .body(r#"{"code":9074,"message":"当前参与用户太多，请稍后再试"}"#);
+        });
+        // 新号 → 成功
+        let mok = server.mock(|when, then| {
+            when.method(POST)
+                .path(EP_CHECKIN_CLAIM)
+                .matches(not_old_device);
+            then.status(200).body(r#"{"code":0,"message":"success"}"#);
+        });
+
+        let up = Upstream::with_bases(&server.url(""), &server.url(""))
+            .with_retry_backoff(std::time::Duration::ZERO);
+        let dir = std::env::temp_dir().join(format!("tsup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cred = cred_with("at", OLD);
+        cred.uid = "u-rot".into();
+
+        let r = up.signin_account(&mut cred, &dir).await;
+        assert_eq!(r.outcome.status, CheckinStatus::Ok, "换号后应签到成功: {r:?}");
+        assert!(r.device_rotated, "应标记本轮换过设备号");
+        assert_ne!(cred.device_id, OLD, "设备号必须被换掉");
+        assert!(
+            crate::login::is_valid_device_id(&cred.device_id),
+            "换出来的号仍须是合法设备号形态，实际 {}",
+            cred.device_id
+        );
+        // DeviceRejected 不进瞬时重试白名单：原号只发一次（同号重试必再拒）
+        m9074.assert_hits(1);
+        mok.assert_hits(1);
+
+        // 新号已回写：重启后继续用它，不会每轮都换
+        let reloaded = crate::auth::list_credentials(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.uid == "u-rot")
+            .expect("换号后的凭证应已落盘");
+        assert_eq!(reloaded.device_id, cred.device_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 9074 若以上游 4xx 送达，同样必须定性为 `DeviceRejected`。
+    ///
+    /// 实测只见过 HTTP 200 送达（`app.log`），但 4xx 路径若落到 `classify_ug`
+    /// 只会得到含糊的 `Other`「HTTP 400」，用户既看不出是设备问题、也不会触发换号。
+    /// 9095 早已按同款双路径防御，9074 补齐。
+    #[tokio::test]
+    async fn claim_9074_via_4xx_is_device_rejected() {
+        for status in [400u16, 403u16] {
+            let server = MockServer::start();
+            let m = server.mock(|when, then| {
+                when.method(POST).path(EP_CHECKIN_CLAIM);
+                then.status(status)
+                    .body(r#"{"code":9074,"message":"当前参与用户太多，请稍后再试"}"#);
+            });
+            let up = Upstream::with_bases(&server.url(""), &server.url(""))
+                .with_retry_backoff(std::time::Duration::ZERO);
+            match up.checkin_claim(&cred_with("at", "d")).await {
+                Err(CoreError::DeviceRejected(msg)) => assert!(msg.contains("9074"), "{msg}"),
+                other => panic!("expect DeviceRejected for HTTP {status}, got {other:?}"),
+            }
+            m.assert_hits(1);
+        }
+    }
+
+    /// 换号限频：同一账号一天内**只自动换一次**号。
+    ///
+    /// 真被上游拒绝的账号如果每轮都换号，24 轮下来凭证里的号全是随机的，
+    /// 真实原因（绑定在别的号上）反而被掩盖。这里直接构造「刚换过」的凭证。
+    #[tokio::test]
+    async fn rotate_device_id_is_rate_limited_to_once_per_day() {
+        let dir = std::env::temp_dir().join(format!("tsup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cred = cred_with("at", "1234567890123456");
+        cred.uid = "u-rate".into();
+        // 一小时前刚换过号
+        cred.device_rotated_at = chrono::Utc::now().timestamp() - 3600;
+        let before = cred.device_id.clone();
+
+        let r = Upstream::rotate_device_id(&mut cred, &dir).await;
+        assert!(r.is_none(), "一天内第二次自动换号必须被拒");
+        assert_eq!(cred.device_id, before, "被限频时不得改号");
+
+        // 超过 24h 后再试应当允许
+        cred.device_rotated_at = chrono::Utc::now().timestamp() - 86_401;
+        let r = Upstream::rotate_device_id(&mut cred, &dir).await;
+        assert!(r.is_some(), "隔天应允许再换一次");
+        assert_ne!(cred.device_id, before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归锚点（PLAN §10 #6）：duration 是时长不是时间戳，一律按秒解释、
@@ -1096,40 +1383,94 @@ mod tests {
         m.assert_hits(1);
     }
 
+    /// 积分口径（2026-11-03 变更）：余额 = usage_summary.total_amount - consumed_amount。
+    ///
+    /// 名义额度累加（旧实现）只涨不落：签到每天新增 100 分包、消耗不写回 credits_limit，
+    /// 于是与 TRAE 客户端显示的余额越用差越多。这里同时断言：
+    /// - 包里的 credits_limit 再大也不参与计算（上方 packs 故意给 999999）；
+    /// - 已消耗部分必须扣掉（3100 - 800 = 2300，而非 3100）。
     #[tokio::test]
-    async fn credits_sum() {
+    async fn credits_remaining() {
         let server = MockServer::start();
         let m = server.mock(|when, then| {
             when.method(POST).path(EP_ENT_USAGE);
             then.status(200).body(
-                r#"{"user_entitlement_pack_list":[
-                     {"entitlement_base_info":{"quota":{"credits_limit":5100}}},
-                     {"entitlement_base_info":{"quota":{"credits_limit":300}}}
+                r#"{"usage_summary":{"total_amount":3100,"consumed_amount":800,"consumption_ratio":0.26},
+                    "user_entitlement_pack_list":[
+                     {"entitlement_base_info":{"quota":{"credits_limit":999999}}},
+                     {"entitlement_base_info":{"quota":{"credits_limit":500}}}
                    ]}"#,
             );
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
-        let total = up.query_credits(&cred_with("at", "d")).await.unwrap();
-        assert_eq!(total, 5400.0);
+        let remaining = up.query_credits(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(remaining, 2300.0);
         m.assert_hits(1);
     }
 
-    /// 小数积分不得截断（2026-09-23 拍板）：旧实现 `f64 as i64` 会把 5900.5 变 5900
+    /// 小数余额同样不得截断（2026-09-23 拍板保留 f64；2026-11-03 口径换成
+    /// total - consumed 后仍需保留小数）。字符串形态的数值一并接受。
     #[tokio::test]
-    async fn credits_keep_fraction() {
+    async fn credits_remaining_keeps_fraction() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path(EP_ENT_USAGE);
             then.status(200).body(
-                r#"{"user_entitlement_pack_list":[
-                     {"entitlement_base_info":{"quota":{"credits_limit":3000.25}}},
-                     {"entitlement_base_info":{"quota":{"credits_limit":"2900.75"}}}
-                   ]}"#,
+                r#"{"usage_summary":{"total_amount":"3100.75","consumed_amount":200.5}}"#,
             );
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
-        let total = up.query_credits(&cred_with("at", "d")).await.unwrap();
-        assert_eq!(total, 5901.0);
+        let remaining = up.query_credits(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(remaining, 2900.25);
+    }
+
+    /// 缺 usage_summary / 缺关键字段 → Err（调用方 .ok() 显示为「积分未知」）。
+    ///
+    /// **不得**退回 `credits_limit` 累加：那正是两边数字对不上的根因，
+    /// 静默兜底等于把已修的 bug 藏回去，还会让用户以为余额是对的。
+    #[tokio::test]
+    async fn credits_remaining_errors_without_usage_summary() {
+        for body in [
+            // 只有名义额度包，没有服务端账本
+            r#"{"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":5400}}}]}"#,
+            // usage_summary 存在但缺 consumed_amount
+            r#"{"usage_summary":{"total_amount":3100}}"#,
+            // usage_summary 存在但缺 total_amount
+            r#"{"usage_summary":{"consumed_amount":100}}"#,
+            // 空对象
+            r#"{}"#,
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(POST).path(EP_ENT_USAGE);
+                then.status(200).body(body);
+            });
+            let up = Upstream::with_bases(&server.url(""), &server.url(""));
+            match up.query_credits(&cred_with("at", "d")).await {
+                Err(CoreError::Other(msg)) => assert!(
+                    msg.contains("usage_summary") || msg.contains("usage_summary.total_amount"),
+                    "错误信息应指明缺 usage_summary 字段，实际: {msg}"
+                ),
+                other => panic!("expect Err for {body}, got {other:?}"),
+            }
+        }
+    }
+
+    /// consumed > total 时余额为负：**如实返回负值并留痕**，不静默截断成 0。
+    ///
+    /// 截断会把「口径/字段归属变了」这种真实信号藏起来——用户看到 0 会以为积分用完了，
+    /// 而实际情况可能是上游把消耗记到了别处。宁可显示负数让人去 app.log 查原始响应体。
+    #[tokio::test]
+    async fn credits_remaining_reports_negative_instead_of_clamping() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path(EP_ENT_USAGE);
+            then.status(200)
+                .body(r#"{"usage_summary":{"total_amount":100,"consumed_amount":250}}"#);
+        });
+        let up = Upstream::with_bases(&server.url(""), &server.url(""));
+        let remaining = up.query_credits(&cred_with("at", "d")).await.unwrap();
+        assert_eq!(remaining, -150.0, "负余额必须如实返回，不得截断为 0");
     }
 
     /// 回归：刷新成功但凭证写盘失败（如盘满/只读）时，ensure_fresh_token 仍 Ok，
@@ -1170,7 +1511,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST).path(EP_ENT_USAGE);
             then.status(200).body(
-                r#"{"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":123}}}]}"#,
+                r#"{"usage_summary":{"total_amount":123,"consumed_amount":0}}"#,
             );
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
@@ -1192,14 +1533,16 @@ mod tests {
         });
         server.mock(|when, then| {
             when.method(POST).path(EP_ENT_USAGE);
-            then.status(200).body(r#"{}"#);
+            then.status(200).body(
+                r#"{"usage_summary":{"total_amount":3100,"consumed_amount":800}}"#,
+            );
         });
         let up = Upstream::with_bases(&server.url(""), &server.url(""));
         let dir = std::env::temp_dir().join(format!("tsup-{}", uuid::Uuid::new_v4()));
         let mut cred = cred_with("at", "d");
         let r = up.signin_account(&mut cred, &dir).await;
         assert_eq!(r.outcome.status, CheckinStatus::Already);
-        assert_eq!(r.credits, Some(0.0));
+        assert_eq!(r.credits, Some(2300.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tauri::async_runtime::JoinHandle;
 use trae_signin_core::auth::Credential;
 use trae_signin_core::login::{
-    build_login_url, gen_device_id, gen_machine_id, gen_trace_id, parse_callback_query,
+    build_login_url, gen_machine_id, gen_trace_id, parse_callback_query,
     LoginParams,
 };
 use trae_signin_core::upstream::Upstream;
@@ -67,10 +67,24 @@ const NOT_FOUND_HTML: &str = "404";
 pub async fn start_login(app: AppHandle) -> Result<u16, String> {
     // listener 与端口同时取得：会话直接持有，杜绝重 bind 失败的 TOCTOU
     let (port, listener) = probe_listener().await?;
+    // 设备号在**打开浏览器之前**就分配好（2026-11-03）：登录链接里的 device_id 与
+    // 落盘凭证里的必须是同一个号，否则上游把登录注册在一个号、签到又用另一个号，
+    // 新账号首次 claim 立刻被 9074 打回。这里按 uid 未知（""）分配 → 只会挑一个
+    // 当前没被任何账号占用的号。
+    let existing = crate::state::state(&app)
+        .current_data_dir()
+        .map(|dir| trae_signin_core::auth::list_credentials(&dir).unwrap_or_default())
+        .unwrap_or_default();
+    let picked = trae_signin_core::login::assign_device_id(
+        "",
+        &existing,
+        &trae_signin_core::login::detect_client_device_ids(),
+    );
+    log::info!("登录前预分配设备号 {}（{}）", picked.device_id, picked.source.as_str());
     let params = LoginParams {
         port,
         machine_id: gen_machine_id(),
-        device_id: gen_device_id(),
+        device_id: picked.device_id,
         login_trace_id: gen_trace_id(),
     };
     let url = build_login_url(&params);
@@ -205,6 +219,7 @@ async fn run_callback_server(
         api_host: trae_signin_core::upstream::OAUTH_HOST.into(),
         machine_id: params.machine_id,
         device_id: params.device_id,
+        device_rotated_at: 0,
         uid: uid.clone(),
         enterprise_id: String::new(),
         nickname: nickname.clone(),
@@ -222,32 +237,39 @@ async fn run_callback_server(
         .current_data_dir()
         .ok_or("数据目录未初始化，请先完成首次设置")?;
 
-    // 自动采用本机客户端真实设备号（PLAN §9：上游收紧后生成号过不了新账号首次绑定）。
-    // 仅当本机检测到唯一号且未被本应用其他账号占用时自动填入；其余情况保持生成号并留痕日志。
-    match trae_signin_core::login::detect_client_device_ids().as_slice() {
-        [id] => {
-            let taken = trae_signin_core::auth::list_credentials(&dir)
-                .map(|cs| cs.iter().any(|c| c.uid != uid && c.device_id == *id))
-                .unwrap_or(false);
-            if taken {
-                log::warn!(
-                    "账号 {uid}：本机客户端设备号已被其他账号占用（一号一天只能签一个账号），保持生成号；首签若 9074 请在另一台装过客户端的机器上提取真号后手动设置"
-                );
-            } else {
-                log::info!("账号 {uid}：已自动采用本机 TRAE 客户端真实设备号");
-                cred.device_id = id.clone();
-            }
-        }
-        [_, ..] => {
-            log::warn!(
-                "账号 {uid}：本机检测到多个客户端设备号，无法自动判定归属，保持生成号；首签若 9074 请用「设置设备号」手动填入"
-            );
-        }
-        [] => {
+    // 设备号自动分配（2026-11-03）：**用户不必自己去 storage.json 里找号**。
+    // 优先级（`login::assign_device_id` 同款）：
+    //   1. 该账号已有合法设备号 → 沿用（重登不换号，别弄坏已验证的绑定）；
+    //   2. 登录链接里预分配、且没被其它账号占用的号 → 采用（上游正是拿它注册的）；
+    //   3. 否则重新分配：本机真机码 → 同源衍生（多账号自动分开）→ 本机指纹推导。
+    let existing = trae_signin_core::auth::list_credentials(&dir).unwrap_or_default();
+    let prior = existing.iter().find(|c| c.uid == uid);
+    let taken_by_other =
+        trae_signin_core::login::device_id_owner(&uid, &cred.device_id, &existing).is_some();
+    if let Some(p) = prior.filter(|c| trae_signin_core::login::is_valid_device_id(&c.device_id)) {
+        if p.device_id != cred.device_id {
             log::info!(
-                "账号 {uid}：未检测到本机 TRAE 客户端设备号（未装客户端或未登录），保持生成号；首签若 9074 请手动设置设备号"
+                "账号 {uid}：沿用已有设备号 {}（登录链接里的 {} 不再使用；重登不换号）",
+                p.device_id,
+                cred.device_id
             );
         }
+        cred.device_id = p.device_id.clone();
+    } else if !trae_signin_core::login::is_valid_device_id(&cred.device_id) || taken_by_other {
+        let pick = trae_signin_core::login::assign_device_id(
+            &uid,
+            &existing,
+            &trae_signin_core::login::detect_client_device_ids(),
+        );
+        log::warn!(
+            "账号 {uid}：登录用设备号不可用（{}），改分配 {}（{}）",
+            if taken_by_other { "已被其它账号占用" } else { "形态非法" },
+            pick.device_id,
+            pick.source.as_str()
+        );
+        cred.device_id = pick.device_id;
+    } else {
+        log::info!("账号 {uid}：设备号 {} 已随登录链接一并注册，无需手动设置", cred.device_id);
     }
 
     trae_signin_core::auth::save_credential(&dir, &cred)
@@ -423,14 +445,36 @@ pub struct ImportResult {
     pub nickname: String,
 }
 
-/// 粘贴 JSON 导入（校验 + 落盘）
+/// 粘贴 JSON 导入（校验 + 自动分配设备号 + 落盘）
+///
+/// 导入的凭证常来自旧版 CLI / 别的机器，设备号可能是 32 位 hex 或干脆缺失；
+/// 这类凭证签到必被 9074 打回。这里导入时就**自动补一个可用设备号**，
+/// 与已有账号分开挑，用户不需要自己去找号（行为与「添加账号」一致）。
 pub fn import_credential_text(
     state: &AppState,
     text: &str,
 ) -> Result<ImportResult, String> {
     let dir = state.current_data_dir().ok_or("数据目录未初始化")?;
-    let cred = trae_signin_core::auth::parse_credential(text)
+    let mut cred = trae_signin_core::auth::parse_credential(text)
         .map_err(|e| format!("凭证格式错误: {e}"))?;
+    let existing = trae_signin_core::auth::list_credentials(&dir).unwrap_or_default();
+    let taken_by_other =
+        trae_signin_core::login::device_id_owner(&cred.uid, &cred.device_id, &existing).is_some();
+    if !trae_signin_core::login::is_valid_device_id(&cred.device_id) || taken_by_other {
+        let pick = trae_signin_core::login::assign_device_id(
+            &cred.uid,
+            &existing,
+            &trae_signin_core::login::detect_client_device_ids(),
+        );
+        log::warn!(
+            "导入账号 {}：设备号不可用（{}），已自动分配 {}（{}）",
+            cred.uid,
+            if taken_by_other { "已被其它账号占用" } else { "形态非法/缺失" },
+            pick.device_id,
+            pick.source.as_str()
+        );
+        cred.device_id = pick.device_id;
+    }
     trae_signin_core::auth::save_credential(&dir, &cred).map_err(|e| e.to_string())?;
     Ok(ImportResult { uid: cred.uid, nickname: cred.nickname })
 }

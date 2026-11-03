@@ -34,6 +34,12 @@ pub struct Credential {
     pub machine_id: String,
     #[serde(rename = "deviceId", default)]
     pub device_id: String,
+    /// 上次因 9074 自动换号的 Unix 秒（0 = 从未换过）。
+    ///
+    /// 只用于**限频**：同一账号一天最多自动换一次号。否则一个真被上游拒绝的账号会在
+    /// 每轮签到里都换一次号，24 轮下来把凭证文件刷成随机数，还掩盖了真实原因。
+    #[serde(rename = "deviceRotatedAt", default)]
+    pub device_rotated_at: i64,
     #[serde(default)]
     pub uid: String,
     #[serde(rename = "enterpriseId", default)]
@@ -86,6 +92,10 @@ fn parse_credential_value(v: &serde_json::Value) -> Result<Credential, crate::Co
         api_host: s(auth, "apiHost"),
         machine_id: s(auth, "machineId"),
         device_id: s(auth, "deviceId"),
+        device_rotated_at: auth
+            .get("deviceRotatedAt")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
         uid: s(account, "uid"),
         enterprise_id: s(account, "enterpriseId"),
         nickname: s(account, "nickname"),
@@ -121,7 +131,8 @@ pub fn to_file_value(cred: &Credential) -> serde_json::Value {
             "domain": cred.domain,
             "apiHost": cred.api_host,
             "machineId": cred.machine_id,
-            "deviceId": cred.device_id
+            "deviceId": cred.device_id,
+            "deviceRotatedAt": cred.device_rotated_at
         },
         "account": {
             "uid": cred.uid,

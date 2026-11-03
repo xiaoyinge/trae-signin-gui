@@ -16,6 +16,10 @@ export type CheckinStatus =
 export interface AccountView {
   uid: string;
   nickname: string;
+  /** 当前设备号（自动分配的真机码；一台设备一天只能签一个账号） */
+  device_id: string;
+  /** 上次因 9074 自动换号的 Unix 秒（0 = 从未换过） */
+  device_rotated_at: number;
   credits: number | null;
   status: CheckinStatus;
   expires_at: number | null;

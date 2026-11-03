@@ -42,6 +42,20 @@ pub fn set_dir(dir: PathBuf) {
     }
 }
 
+/// 装 panic 钩子：保留默认输出（dev 下 console 可见）之外，把 panic 信息落 app.log。
+///
+/// 为什么必须有它：`windows_subsystem = "windows"` 下没有 console，panic 消息写到
+/// stderr 无人接收；release 又是 `panic = "abort"`，任何 panic 都直接杀死整个进程。
+/// 没有这个钩子时，「进程莫名退出」将不留任何痕迹、无从取证（2026-09-30 排障实录：
+/// 只能靠排除法定位）。abort 前钩子必被执行，此后每次 panic 死亡都有尸检报告。
+pub fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        log::error!("panic: {info}");
+    }));
+}
+
 struct FileLogger;
 
 impl log::Log for FileLogger {

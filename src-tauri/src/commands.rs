@@ -17,6 +17,12 @@ use trae_signin_core::CheckinStatus;
 pub struct AccountView {
     pub uid: String,
     pub nickname: String,
+    /// 当前设备号（自动分配的真机码，或用户手动覆盖的号）。
+    /// 界面上要能看到：一台设备一天只能签一个账号，撞号时用户得一眼看出两个账号是不是同号。
+    pub device_id: String,
+    /// 上次因 9074 自动换号的时间（Unix 秒，0 = 从未）。
+    /// 界面据此提示「今日已自动换号」，让用户知道上游拒过、程序动过号。
+    pub device_rotated_at: i64,
     pub credits: Option<f64>,
     pub status: CheckinStatus,
     pub expires_at: Option<i64>,
@@ -38,6 +44,8 @@ fn account_views(state: &AppState) -> Vec<AccountView> {
             AccountView {
                 uid: c.uid,
                 nickname: c.nickname,
+                device_id: c.device_id.clone(),
+                device_rotated_at: c.device_rotated_at,
                 credits: t.credits,
                 status: t.status,
                 expires_at: t.expires_at.or(Some(c.expires_at)),
@@ -299,11 +307,11 @@ pub async fn delete_account(app: AppHandle, uid: String) -> Result<bool, String>
     Ok(deleted)
 }
 
-/// 手动设置账号设备号（从 TRAE 客户端 `storage.json` 键名
-/// `iCubeAuthInfo://icube-dc:{16位号}` 提取的真实 Aha 号）。
+/// 手动设置账号设备号（覆盖自动分配的结果）。
 ///
-/// 背景（PLAN §9，2026-09-29 实测）：上游收紧 claim 设备校验后，应用内生成的设备号
-/// 无法通过**新账号**首次绑定（status 可读、claim 一律 9074），需改用客户端真号。
+/// 设备号本来在添加/导入时已自动分配（见 `login::assign_device_id`），本命令只用于
+/// 人工覆盖：填错了号、或要把另一台机器上客户端注册过的真号搬过来。
+/// 撞号不拦截但会留痕——一台设备一天只能签一个账号，撞号的另一个会得 9095。
 #[tauri::command]
 pub async fn set_device_id(
     app: AppHandle,
@@ -327,16 +335,28 @@ pub async fn set_device_id(
     let dir = st.current_data_dir().ok_or("数据目录未初始化")?;
     let mut creds =
         trae_signin_core::auth::list_credentials(&dir).map_err(|e| format!("读取凭证失败: {e}"))?;
+    if !creds.iter().any(|c| c.uid == uid) {
+        return Err(format!("账号 {uid} 不存在"));
+    }
+    if creds.iter().any(|c| c.uid == uid && c.device_id == device_id) {
+        return Ok(false);
+    }
+    // 撞号检查（一台设备一天只能签一个账号）：不拦截（用户可能在迁号），
+    // 但必须留痕——否则下次 claim 回 9095 时没人知道是这里填重了。
+    if let Some(owner) = trae_signin_core::login::device_id_owner(&uid, &device_id, &creds) {
+        log::warn!("账号 {uid} 手动设备号 {device_id} 与账号 {owner} 相同，两者同日只能签一个（另一个会得 9095）");
+    } else {
+        log::info!("账号 {uid} 设备号已手动更新为 {device_id}");
+    }
     let cred = creds
         .iter_mut()
         .find(|c| c.uid == uid)
-        .ok_or_else(|| format!("账号 {uid} 不存在"))?;
-    if cred.device_id == device_id {
-        return Ok(false);
-    }
+        .expect("上面已确认账号存在");
     cred.device_id = device_id;
+    // 手动改号是用户的明确意志：把自动换号限频一并重置，否则「今天自动换过一次」
+    // 会让后续 9074 不再自动兜底（用户刚填过一个号，理应再获得一次自动换号机会）。
+    cred.device_rotated_at = 0;
     trae_signin_core::auth::save_credential(&dir, cred).map_err(|e| format!("保存凭证失败: {e}"))?;
-    log::info!("账号 {uid} 设备号已手动更新为客户端真实设备号");
     let _ = app.emit("accounts://changed", ());
     Ok(true)
 }
@@ -496,8 +516,16 @@ pub async fn run_signin_round(
         emit("checking", "查询签到状态…", None, None);
         let result = upstream.signin_account(cred, &dir).await;
         let no_progress = result.retryable || result.refresh_failed;
-        let outcome = result.outcome;
+        let mut outcome = result.outcome;
         let credits = result.credits;
+        // 9074 换过号时把真实原因写进终局文案（上游那句「参与用户太多」是幌子，
+        // 直接把原文当结果给用户看他只会去重试）。
+        if result.device_rotated {
+            outcome.message = format!(
+                "{}（上游设备校验未通过 9074，已自动改用设备号 {} 重试）",
+                outcome.message, cred.device_id
+            );
+        }
 
         // 更新缓存
         let now_ts = chrono::Utc::now().timestamp();
@@ -512,6 +540,9 @@ pub async fn run_signin_round(
                 last_run_ts: Some(now_ts),
             },
         );
+        if result.device_rotated {
+            log::warn!("账号 {uid}：本轮设备号未被上游认可（9074），已自动换号为 {}", cred.device_id);
+        }
 
         match outcome.status {
             CheckinStatus::Ok => summary.ok += 1,
@@ -665,7 +696,13 @@ pub async fn run_refresh_round_inner(
                 CheckinStatus::NotSigned
             };
         }
-        t.credits = upstream.query_credits(cred).await.ok();
+        t.credits = match upstream.query_credits(cred).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!("{uid} 积分查询失败（界面显示为未知）: {e}");
+                None
+            }
+        };
         t.expires_at = Some(cred.expires_at);
         t.last_run_ts = Some(chrono::Utc::now().timestamp());
         st.update_today(&uid, t.clone());

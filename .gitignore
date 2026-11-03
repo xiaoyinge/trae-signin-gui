@@ -15,6 +15,9 @@ _log_probe.txt
 # 本地开发笔记与原始素材不入库
 impeg/
 
+# DSH 本地会话面板（含完整对话记录与本机标识，绝不可入库）
+.dsh-ops/
+
 # 编辑器
 .vscode/
 .idea/

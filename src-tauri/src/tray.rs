@@ -103,7 +103,9 @@ pub fn update_tray(app: &AppHandle) {
     );
 }
 
-/// 关闭窗口行为（CloseRequested 时调用）：返回 true = 已拦截隐藏到托盘
+/// 关闭窗口行为（CloseRequested 时调用）：返回 true = 已拦截隐藏到托盘；
+/// 返回 false = 用户选择「关窗即退出」——由 lib.rs 统一走 app.exit(0)
+/// （不走「放任窗口销毁」，那条路径已被 ExitRequested 守卫接管为意外销毁重建）
 pub fn handle_close(app: &AppHandle) -> bool {
     let settings: Settings = crate::state::state(app).current_settings();
     if settings.close_to_tray {

@@ -11,6 +11,10 @@ use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // panic 钩子最先装：panic=abort 下任何 panic 都会带走整个进程，
+    // 唯一取证通道就是这里（见 logger.rs 注释）
+    logger::install_panic_hook();
+
     let hidden = launched_hidden();
     tauri::Builder::default()
         // 单实例必须第一个注册（官方约定）：二次启动转发参数后立即退出
@@ -82,13 +86,98 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let app = window.app_handle();
-                if tray::handle_close(app) {
-                    api.prevent_close();
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    let app = window.app_handle();
+                    if tray::handle_close(app) {
+                        api.prevent_close();
+                    } else {
+                        // close_to_tray=false：关窗即退出。显式走 app.exit（RequestExit 路径，
+                        // 会在 run 回调里 mark_exiting）而不是放任窗口销毁——「窗口销毁」这条
+                        // 路径已被 run 回调的 ExitRequested 守卫接管为「意外销毁→重建」。
+                        api.prevent_close();
+                        app.exit(0);
+                    }
                 }
+                WindowEvent::Destroyed => {
+                    // 诊断锚点：与下方 run 回调的 ExitRequested 守卫配合，
+                    // 区分「Tauri 正常退出路径」与「外部强杀」（外部 TerminateProcess 不进事件循环）
+                    log::warn!("窗口销毁: {}", window.label());
+                }
+                _ => {}
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            // 坑（2026-09-30 定位）：Tauri/runtime 默认「最后一个窗口 Destroyed → 退出整个
+            // 进程」。用户点 X 已被 CloseRequested 拦截，所以能走到这里的销毁只剩一种来源：
+            // WebView2 进程死亡（Evergreen 运行时自动更新、系统资源回收等）——进程退出无任何
+            // 崩溃痕迹（WER/事件日志/Crashpad 全干净），app.log 里表现为「日志戛然而止、数小时
+            // 后新实例启动」。防护：拦下这类退出并重建主窗口，托盘常驻进程不倒。
+            tauri::RunEvent::ExitRequested { code, api, .. } => match code {
+                // 主动退出（托盘退出 / close_to_tray=false 关窗 / restart）：放行
+                Some(_) => state::state(app).mark_exiting(),
+                None => {
+                    // 退出流程中顺带发生的窗口销毁（app.exit 后 ControlFlow::Exit 的清理阶段）
+                    if !state::state(app).is_exiting() {
+                        api.prevent_exit();
+                        log::error!(
+                            "主窗口意外销毁（WebView2 进程退出或运行时更新），已拦截退出并重建窗口"
+                        );
+                        rebuild_main_window(app);
+                    }
+                }
+            },
+            // 事件循环即将退出（主动退出路径终态，或 prevent 未生效）。留痕用于
+            // 区分「Tauri 自身退出」与「外部 TerminateProcess 强杀」（后者 app.log 戛然而止、无此行）
+            tauri::RunEvent::Exit => {
+                log::warn!(
+                    "Tauri 事件循环退出（exiting={}）",
+                    state::state(app).is_exiting()
+                );
+            }
+            _ => {}
+        });
+}
+
+/// 重建主窗口（按 tauri.conf.json 的 main 配置，含 visible:false——保持隐藏、托盘常驻，
+/// 用户点托盘图标再显示）。WebView2 运行时更新未就绪时 build 会失败，带退避重试。
+fn rebuild_main_window(app: &tauri::AppHandle) {
+    let Some(conf) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+    else {
+        log::error!("tauri.conf.json 中找不到 main 窗口配置，无法重建窗口");
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &conf).and_then(|b| b.build()) {
+        Ok(_) => log::info!("主窗口已重建（保持隐藏，托盘常驻，签到调度不受影响）"),
+        Err(e) => {
+            log::error!("主窗口重建失败: {e}，稍后自动重试");
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                for delay_secs in [5u64, 15, 45, 120] {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    if app2.get_webview_window("main").is_some() {
+                        return; // 别处（如重试竞态）已重建
+                    }
+                    match tauri::WebviewWindowBuilder::from_config(&app2, &conf)
+                        .and_then(|b| b.build())
+                    {
+                        Ok(_) => {
+                            log::info!("主窗口重建成功（退避重试后），保持隐藏、托盘常驻");
+                            return;
+                        }
+                        Err(e) => log::error!("主窗口重建重试失败（{delay_secs}s 后再试）: {e}"),
+                    }
+                }
+                log::error!("主窗口多次重建失败，应用以纯托盘模式运行（签到调度不受影响）");
+            });
+        }
+    }
 }
